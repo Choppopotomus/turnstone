@@ -722,7 +722,11 @@ def _extract_context_window(model_obj: Any, provider: str) -> int | None:
         return max_len
     meta = model_data.get("meta")
     if isinstance(meta, dict):
-        n_ctx = meta.get("n_ctx_train")
+        # n_ctx is the server's actual deployed window (--ctx-size); n_ctx_train
+        # is the model's theoretical architectural max and can badly overshoot
+        # what's actually usable -- e.g. Qwen3.6 reports n_ctx_train=262144 while
+        # a real deployment might run --ctx-size 32768. Prefer the real one.
+        n_ctx = meta.get("n_ctx") or meta.get("n_ctx_train")
         if isinstance(n_ctx, int) and n_ctx > 0:
             return n_ctx
     return None

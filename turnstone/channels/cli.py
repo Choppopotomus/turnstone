@@ -96,6 +96,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Slack slash command name (default: /turnstone)",
     )
 
+    # -- Matrix --------------------------------------------------------------
+    parser.add_argument(
+        "--matrix-homeserver",
+        default=os.environ.get("TURNSTONE_MATRIX_HOMESERVER", ""),
+        help="Matrix homeserver URL (default: $TURNSTONE_MATRIX_HOMESERVER)",
+    )
+    parser.add_argument(
+        "--matrix-user",
+        default=os.environ.get("TURNSTONE_MATRIX_USER", ""),
+        help="Matrix user ID (default: $TURNSTONE_MATRIX_USER)",
+    )
+    parser.add_argument(
+        "--matrix-password",
+        default=os.environ.get("TURNSTONE_MATRIX_PASSWORD", ""),
+        help="Matrix password (default: $TURNSTONE_MATRIX_PASSWORD)",
+    )
+    parser.add_argument(
+        "--matrix-device-id",
+        default=os.environ.get("TURNSTONE_MATRIX_DEVICE_ID", "TURNSTONE"),
+        help="Matrix device ID (default: $TURNSTONE_MATRIX_DEVICE_ID)",
+    )
+    parser.add_argument(
+        "--matrix-store-path",
+        default=os.environ.get("TURNSTONE_MATRIX_STORE_PATH", ""),
+        help="Matrix nio store path (default: $TURNSTONE_MATRIX_STORE_PATH)",
+    )
+
     # -- HTTP server ---------------------------------------------------------
     parser.add_argument(
         "--http-host",
@@ -279,6 +306,32 @@ def _build_adapters(
         )
         adapters[slack_bot.channel_type] = cast("ChannelAdapter", slack_bot)
 
+    if args.matrix_homeserver:
+        from turnstone.channels.matrix.bot import TurnstoneMatrixBot
+        from turnstone.channels.matrix.config import MatrixConfig
+
+        matrix_config = MatrixConfig(
+            server_url=server_url,
+            model=args.model,
+            auto_approve=args.auto_approve,
+            homeserver=args.matrix_homeserver,
+            user_id=args.matrix_user,
+            password=args.matrix_password,
+            device_id=args.matrix_device_id,
+            store_path=args.matrix_store_path or os.path.expanduser(
+                "~/.local/share/turnstone/matrix-store"
+            ),
+        )
+        matrix_bot = TurnstoneMatrixBot(
+            matrix_config,
+            server_url=server_url,
+            storage=storage,
+            console_url=console_url,
+            console_token_factory=console_token_factory,
+            server_token_factory=server_token_factory,
+        )
+        adapters[matrix_bot.channel_type] = cast("ChannelAdapter", matrix_bot)
+
     return adapters
 
 
@@ -398,7 +451,7 @@ def main() -> None:
     if bool(args.slack_token) != bool(args.slack_app_token):
         raise SystemExit("--slack-token and --slack-app-token must be provided together")
 
-    has_adapters = bool(args.discord_token or args.slack_token)
+    has_adapters = bool(args.discord_token or args.slack_token or args.matrix_homeserver)
 
     # Adapters need to reach the server/console; standby doesn't.
     if has_adapters and not console_url and not server_url:
