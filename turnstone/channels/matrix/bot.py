@@ -114,7 +114,19 @@ class StreamingMessage:
 
 
 class TurnstoneMatrixBot:
-    """Matrix bot bridging Matrix rooms to turnstone workstreams."""
+    """Matrix bot bridging Matrix rooms to turnstone workstreams.
+
+    All room_send() calls pass ignore_unverified_devices=True. This is a
+    deliberate, permanent trust decision, not an oversight: without it,
+    nio raises OlmUnverifiedDeviceError for any device the bot hasn't
+    explicitly verified, which blocks every encrypted send until someone
+    completes device verification -- and previously did so silently,
+    because the exception was swallowed at a log level below the
+    configured threshold (see the room_send() call sites). Acceptable
+    here because this bot serves one user on a homeserver only that
+    user controls; reconsider if this ever bridges rooms with untrusted
+    third parties.
+    """
 
     channel_type: str = "matrix"
     _MAX_NOTIFY_TRACKING: int = MAX_NOTIFY_TRACKING
