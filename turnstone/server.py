@@ -5249,6 +5249,27 @@ def main() -> None:
         _cfg = registry.get_config(_alias)
         health_registry.get_tracker(provider=_cfg.provider, base_url=_cfg.base_url)
 
+    # Proxy-trace ingestion (2026-07-27): any backend whose base_url points
+    # at a local claude_proxy.py instance (e.g. "claude-subscription" →
+    # http://127.0.0.1:9999/v1) is not a stateless completion endpoint — it
+    # shells out to `claude -p` and the wire response never carries a
+    # tool_calls delta, so the per-call judge above never fires for it. See
+    # turnstone.core.proxy_trace for the full gap description. This reads
+    # that backend's debug log (if the file exists — most deployments won't
+    # have one, which is a silent no-op, not an error) and upserts one
+    # advisory, session-level intent_verdicts row per proxied session it
+    # finds, on a polling interval. Auto-detected from the existing model
+    # registry — no new config surface.
+    from turnstone.core.proxy_trace import ProxyTraceWatcher, port_from_base_url
+
+    _proxy_trace_targets = [
+        (_alias, registry.get_config(_alias).base_url)
+        for _alias in registry.list_aliases()
+        if port_from_base_url(registry.get_config(_alias).base_url) is not None
+    ]
+    if _proxy_trace_targets:
+        ProxyTraceWatcher(_get_storage(), _proxy_trace_targets).start()
+
     # Per-IP rate limiter
     from turnstone.core.ratelimit import RateLimiter
 
