@@ -19,6 +19,7 @@ ConfigStore) — it is a standalone tool, not a cluster node.
 from __future__ import annotations
 
 import threading
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
 from turnstone.core.log import get_logger
@@ -52,6 +53,13 @@ class ConfigStore:
         self._cache: dict[str, Any] = {}
         self._lock = threading.Lock()
         self._version = 0
+        # Health signal for reload() — set before the first reload() call
+        # below so a first-load failure leaves well-defined attributes
+        # (last_reload_ok=False, cache stays {}) instead of raising
+        # AttributeError from inside the except branch.
+        self._last_reload_ok = True
+        self._last_reload_at: str | None = None
+        self._last_reload_error: str | None = None
         self.reload()
 
     @property
@@ -64,11 +72,53 @@ class ConfigStore:
         """Monotonic counter incremented on every cache update."""
         return self._version
 
+    @property
+    def last_reload_ok(self) -> bool:
+        """Whether the most recent :meth:`reload` completed without error.
+
+        ``True`` initially (optimistic default) until the first
+        :meth:`reload` call in ``__init__`` resolves it one way or the
+        other. Consumers (e.g. the ``/health`` endpoint) should treat
+        ``False`` as a real degraded signal — it means storage could not
+        be queried at all, and the cache may be stale.
+        """
+        return self._last_reload_ok
+
+    @property
+    def last_reload_at(self) -> str | None:
+        """UTC ISO-8601 timestamp of the most recent reload attempt (ok or not)."""
+        return self._last_reload_at
+
+    @property
+    def last_reload_error(self) -> str | None:
+        """String repr of the exception from the most recent failed reload, if any."""
+        return self._last_reload_error
+
     def reload(self) -> None:
-        """Load all settings from storage into the in-memory cache."""
+        """Load all settings from storage into the in-memory cache.
+
+        On a storage query failure, the exception is logged and
+        ``last_reload_ok`` is set to ``False`` — the cache is left as-is
+        (stale-but-present beats empty) but the failure is now a real,
+        checkable signal rather than only a log line.
+
+        On a successful query that returns *fewer* keys than the current
+        cache (including a drop to zero), a warning is logged — ``set()``
+        and ``delete()`` mutate the cache directly and never call
+        ``reload()``, so a shrink observed here means storage changed
+        out from under this process (external delete, or a wipe). This
+        is not refused — an operator may have made a legitimate change
+        on another node — but it must not pass silently.
+        """
+        old_count = len(self._cache)
+        now = datetime.now(UTC).isoformat()
         try:
             raw = self._storage.get_system_settings_bulk(node_id=self._node_id)
-        except Exception:
+        except Exception as exc:
+            with self._lock:
+                self._last_reload_ok = False
+                self._last_reload_error = repr(exc)
+                self._last_reload_at = now
             log.warning("Failed to load settings from storage", exc_info=True)
             return
         new_cache: dict[str, Any] = {}
@@ -77,9 +127,22 @@ class ConfigStore:
                 new_cache[key] = deserialize_value(key, json_val)
             except (ValueError, KeyError):
                 log.warning("Skipping invalid setting: %s", key)
+        new_count = len(new_cache)
+        if new_count < old_count:
+            log.warning(
+                "ConfigStore.reload(): cache shrank from %d to %d key(s) — storage "
+                "returned fewer settings than the current cache. This reload path is "
+                "never reached by set()/delete(), so this reflects a real change in "
+                "storage (external delete, or a wipe) rather than local mutation.",
+                old_count,
+                new_count,
+            )
         with self._lock:
             self._cache = new_cache
             self._version += 1
+            self._last_reload_ok = True
+            self._last_reload_error = None
+            self._last_reload_at = now
 
     def get(self, key: str, default: Any = _UNSET) -> Any:
         """Get a setting value from cache.

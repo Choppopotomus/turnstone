@@ -1584,8 +1584,14 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
         if tracker is None:
             tracker = health_reg.get_tracker_for_alias(registry, registry.default)
     backend_ok = tracker.is_healthy if tracker else True
+    # ConfigStore reload health — a failed reload leaves the cache stale
+    # (possibly still all-defaults if it never loaded at all, e.g. the
+    # session.instructions persona going silently empty), and previously
+    # had no checkable signal anywhere. See config_store.reload().
+    config_store = getattr(app_state, "config_store", None)
+    config_ok = config_store.last_reload_ok if config_store is not None else True
     data: dict[str, Any] = {
-        "status": "ok" if backend_ok else "degraded",
+        "status": "ok" if (backend_ok and config_ok) else "degraded",
         "version": __version__,
         "node_id": getattr(app_state, "node_id", ""),
         "uptime_seconds": round(time.monotonic() - _metrics.start_time, 2),
@@ -1602,6 +1608,14 @@ def _build_health_dict(app_state: Any) -> dict[str, Any]:
             "servers": mc.server_count,
             "resources": mc.resource_count,
             "prompts": mc.prompt_count,
+        }
+    # Only present when a ConfigStore is wired up (always true in the real
+    # server; tests that build a bare app may omit it). reload_ok=False
+    # means the last reload() failed and the cache may be stale.
+    if config_store is not None:
+        data["config_store"] = {
+            "reload_ok": config_ok,
+            "last_reload_at": config_store.last_reload_at,
         }
     # Only present when tls.enabled: "active" (serving HTTPS) or "fallback"
     # (TLS init failed, serving plain HTTP). Makes a silently-downgraded
