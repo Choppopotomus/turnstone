@@ -9198,6 +9198,7 @@ class ChatSession:
             llm_reasoning=llm.reasoning if llm else "",
             llm_confidence=llm.confidence if llm else 0.0,
             llm_model=llm.judge_model if llm else "",
+            heuristic_scan_complete=heuristic.scan_complete,
         )
         if d is None:
             return output, None

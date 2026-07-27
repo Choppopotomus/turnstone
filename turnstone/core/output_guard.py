@@ -235,6 +235,8 @@ class OutputAssessment:
     risk_level: str = "none"  # "none" | "low" | "medium" | "high"
     annotations: list[str] = field(default_factory=list)
     sanitized: str | None = None
+    scan_complete: bool = True  # False when the time budget cut the scan short —
+    # a "none" risk_level under scan_complete=False is unknown, not confirmed clean.
 
     def to_dict(self, *, include_sanitized: bool = False) -> dict[str, Any]:
         """Serialize for JSON / SSE transport.
@@ -246,6 +248,7 @@ class OutputAssessment:
             "flags": list(self.flags),
             "risk_level": self.risk_level,
             "annotations": list(self.annotations),
+            "scan_complete": self.scan_complete,
         }
         if include_sanitized:
             d["sanitized"] = self.sanitized
@@ -269,6 +272,7 @@ def merge_guard_display_payload(
     llm_reasoning: str = "",
     llm_confidence: float = 0.0,
     llm_model: str = "",
+    heuristic_scan_complete: bool = True,
 ) -> dict[str, Any] | None:
     """Merge the heuristic + LLM-judge findings into the single chip payload.
 
@@ -306,7 +310,9 @@ def merge_guard_display_payload(
         if f and f not in flags:
             flags.append(f)
 
-    if risk == "none" and not redacted:
+    # A budget-starved heuristic scan reporting "none" is unknown, not clean —
+    # it must not take the skip-on-clean path meant for a genuinely clean scan.
+    if risk == "none" and not redacted and heuristic_scan_complete:
         return None
 
     payload: dict[str, Any] = {
@@ -314,6 +320,8 @@ def merge_guard_display_payload(
         "flags": flags,
         "redacted": bool(redacted),
     }
+    if not heuristic_scan_complete:
+        payload["scan_complete"] = False
     if heuristic_annotations:
         payload["annotations"] = list(heuristic_annotations)
     if llm_succeeded:
@@ -1111,7 +1119,7 @@ def evaluate_output(
                     _check_info_disclosure_complex(output, flags, ann),
                 )
             if time.monotonic() > deadline:
-                return _build(flags, risk, ann, sanitized)
+                return _build(flags, risk, ann, sanitized, scan_complete=False)
         return _build(flags, risk, ann, sanitized)
 
     # Legacy mode: hard-coded patterns (backward compat)
@@ -1123,23 +1131,23 @@ def evaluate_output(
         _check_marker_forgery(output, flags, ann, trusted_marker_nonce, trusted_sender_label_nonce),
     )
     if time.monotonic() > deadline:
-        return _build(flags, risk, ann, sanitized)
+        return _build(flags, risk, ann, sanitized, scan_complete=False)
 
     # Priority 2: credential leakage
     cred_risk, sanitized = _check_credentials(output, flags, ann)
     risk = _max_risk(risk, cred_risk)
     if time.monotonic() > deadline:
-        return _build(flags, risk, ann, sanitized)
+        return _build(flags, risk, ann, sanitized, scan_complete=False)
 
     # Priority 3: encoded / obfuscated payloads
     risk = _max_risk(risk, _check_encoded_payloads(output, flags, ann))
     if time.monotonic() > deadline:
-        return _build(flags, risk, ann, sanitized)
+        return _build(flags, risk, ann, sanitized, scan_complete=False)
 
     # Priority 4: adversarial URLs
     risk = _max_risk(risk, _check_adversarial_urls(output, flags, ann))
     if time.monotonic() > deadline:
-        return _build(flags, risk, ann, sanitized)
+        return _build(flags, risk, ann, sanitized, scan_complete=False)
 
     # Priority 5: system information disclosure
     risk = _max_risk(risk, _check_info_disclosure(output, flags, ann))
@@ -1152,6 +1160,8 @@ def _build(
     risk_level: str,
     annotations: list[str],
     sanitized: str | None,
+    *,
+    scan_complete: bool = True,
 ) -> OutputAssessment:
     """Construct a frozen OutputAssessment, deduplicating flags and annotations."""
     seen: set[str] = set()
@@ -1171,4 +1181,5 @@ def _build(
         risk_level=risk_level,
         annotations=unique_ann,
         sanitized=sanitized,
+        scan_complete=scan_complete,
     )
