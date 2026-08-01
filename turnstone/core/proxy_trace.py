@@ -66,7 +66,14 @@ _FULL_OUTPUT_RE = re.compile(r"^\s*full_output:\s*(\{.*\})\s*$", re.MULTILINE)
 # live judge's turn cap.
 _HIGH_TURN_THRESHOLD = 5
 
-DEBUG_LOG_TEMPLATE = "~/.hermes/logs/claude-proxy-{port}-debug.log"
+# Confirmed against ~/.hermes's claude_proxy.py source (2026-07-31): its
+# main() sets `DEBUG_LOG = f"/Users/c/Library/Logs/claude-proxy-{port}-debug.log"`
+# — _dlog() has never written to ~/.hermes/logs/. That directory does not
+# exist on disk. The template below previously pointed at it, which meant
+# `sync_proxy_trace_verdicts`'s `if not path.exists(): return 0` fired on
+# every poll tick for every port — this was a dead module, not a live one
+# with a rotation gap. Fixed to match the real write path.
+DEBUG_LOG_TEMPLATE = "~/Library/Logs/claude-proxy-{port}-debug.log"
 
 # Bound on the "already seen" read in sync_proxy_trace_verdicts — the debug
 # log has no rotation, but a claude_proxy.py instance realistically produces
@@ -74,7 +81,48 @@ DEBUG_LOG_TEMPLATE = "~/.hermes/logs/claude-proxy-{port}-debug.log"
 # generous headroom, not a tight fit.
 _ALREADY_SEEN_LIMIT = 10_000
 
+# --- Decision: not reading rotated .N.gz archives (2026-07-31) ---
+#
+# `~/Library/Logs/logrotate.sh` (run daily via the `local.hermes.logrotate`
+# launchd job) rotates a fixed, explicit list of filenames once they exceed
+# 512KB, keeping 5 gzip archives per name. That list is: claude-proxy.log,
+# claude-proxy-err.log, claude-proxy-poe.log, claude-proxy-poe-err.log,
+# claude-proxy-council.log, claude-proxy-council-err.log,
+# claude-proxy-debug.log, claude-proxy-research.log,
+# claude-proxy-research-err.log. The per-port debug logs this module reads
+# — claude-proxy-{port}-debug.log, e.g. claude-proxy-9998-debug.log — are
+# NOT in that list under any name. Verified directly against the script
+# and against disk: `find ~/Library/Logs -iname 'claude-proxy-9998-debug.log*'`
+# returns exactly one file (the live, uncompressed log), no .0.gz/.1.gz/etc.
+# The rotation job simply does not touch these files today.
+#
+# Net effect: there is currently no rotated-archive history to recover for
+# ANY port, so .gz-reading code here would be speculative complexity for an
+# event that doesn't occur under the current logrotate.sh. The real defect
+# blocking visibility was `DEBUG_LOG_TEMPLATE` pointing at a nonexistent
+# directory (fixed above) — that silently zeroed out ALL proxy-trace
+# ingestion, live traffic included, for every port, which is a strictly
+# bigger gap than "rotated archives are unreachable."
+#
+# Tradeoff being accepted: if `logrotate.sh` is ever extended to rotate
+# these per-port files (an easy one-line addition to its `rotate` calls,
+# given it's already the launchd job responsible for their 600-permission
+# enforcement), this module will start silently losing whatever has aged
+# past the live file's window — same failure mode the task description
+# assumed was already happening. That is the condition under which
+# .gz-reading becomes worth building; it is not the condition today.
+# Revisit this decision if/when logrotate.sh's rotate list changes.
+
 _BASE_URL_PORT_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost):(\d+)/?")
+
+# Tracks the debug log's byte size as of the last `sync_proxy_trace_verdicts`
+# call, keyed by resolved path string. Lets that function tell "the log grew
+# but nothing parsed out of it" (upstream format drift — worth a warning)
+# apart from "the log hasn't grown at all" (no new proxied traffic since the
+# last poll tick — a normal, silent no-op). Process-lifetime only: a restart
+# re-baselines from 0, which at worst produces one extra warning check on the
+# first tick rather than a missed one.
+_last_log_size: dict[str, int] = {}
 
 
 def port_from_base_url(base_url: str) -> int | None:
@@ -213,6 +261,14 @@ def sync_proxy_trace_verdicts(storage: Any, *, alias: str, base_url: str) -> int
     slips past the "already seen" check (e.g. a first run against a log
     with more history than the read's limit) is still idempotent, just not
     write-free.
+
+    Also warns (``proxy_trace.zero_parsed_on_growth``) when the log file is
+    non-empty and has grown since the previous call to this function but
+    zero ``full_output`` records were parsed from it — the signature of
+    ``_FULL_OUTPUT_RE`` silently no longer matching an upstream log-line
+    format change. A log that simply hasn't grown (no new proxied traffic
+    since the last poll tick) stays silent — that path is normal, not an
+    error.
     """
     port = port_from_base_url(base_url)
     if port is None:
@@ -226,6 +282,12 @@ def sync_proxy_trace_verdicts(storage: Any, *, alias: str, base_url: str) -> int
         log.warning("proxy_trace.read_error", path=str(path))
         return 0
 
+    path_key = str(path)
+    previous_size = _last_log_size.get(path_key, 0)
+    current_size = len(text)
+    grew = current_size > previous_size
+    _last_log_size[path_key] = current_size
+
     known_ids = {
         row["verdict_id"]
         for row in storage.list_intent_verdicts(
@@ -233,8 +295,17 @@ def sync_proxy_trace_verdicts(storage: Any, *, alias: str, base_url: str) -> int
         )
     }
 
+    records = parse_full_output_records(text)
+    if grew and not records and text.strip():
+        log.warning(
+            "proxy_trace.zero_parsed_on_growth",
+            path=path_key,
+            previous_size=previous_size,
+            current_size=current_size,
+        )
+
     count = 0
-    for record in parse_full_output_records(text):
+    for record in records:
         row = verdict_row_from_record(record, alias=alias, port=port)
         if row["verdict_id"] in known_ids:
             continue
