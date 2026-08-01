@@ -99,6 +99,35 @@ class TestBuildVerdictPayload:
         assert out is not None
         assert "judge_model" not in out
 
+    def test_includes_unexpected_tools_from_evidence(self) -> None:
+        """The proxy_trace grant-conformance check appends UNEXPECTED_TOOL:<name>
+        entries to evidence; this is the only part of evidence that reaches
+        the wire (see Does NOT do — the full tool_names list stays pointer-only)."""
+        row = {
+            "risk_level": "high",
+            "tier": "proxy_trace",
+            "evidence": json.dumps(
+                [
+                    "num_turns=3",
+                    'tool_names=["Bash", "Read", "mcp__unknown__frob"]',
+                    "UNEXPECTED_TOOL:mcp__unknown__frob",
+                ]
+            ),
+        }
+        out = build_verdict_payload(row)
+        assert out["unexpected_tools"] == ["mcp__unknown__frob"]
+
+    def test_omits_unexpected_tools_when_none_present(self) -> None:
+        """No UNEXPECTED_TOOL entries in evidence → the field is absent
+        entirely, and the full tool_names list must never leak through."""
+        row = {
+            "risk_level": "low",
+            "tier": "proxy_trace",
+            "evidence": json.dumps(["num_turns=1", 'tool_names=["Bash", "Read"]']),
+        }
+        out = build_verdict_payload(row)
+        assert "unexpected_tools" not in out
+
 
 class TestBuildMergedOutputAssessmentPayload:
     """Replay-side merge of the heuristic + LLM rows into one chip payload.

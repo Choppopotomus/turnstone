@@ -115,6 +115,112 @@ _ALREADY_SEEN_LIMIT = 10_000
 
 _BASE_URL_PORT_RE = re.compile(r"^https?://(?:127\.0\.0\.1|localhost):(\d+)/?")
 
+# Per-port --allowedTools grants, used only for the UNEXPECTED_TOOL
+# conformance check below (Scope: "compare against the port's configured
+# grant"). A name matches if it equals a grant entry exactly or falls under
+# a "prefix__*" wildcard grant.
+# ponytail: hardcoded from the plists' actual --allowedTools args (confirmed
+# 2026-07-31), not read live — drifts silently if a plist's grant changes
+# without this dict being updated. Upgrade path: parse each
+# ai.hermes.claude-proxy-*.plist's ProgramArguments if this ever causes a
+# false UNEXPECTED_TOOL.
+PORT_ALLOWED_TOOLS: dict[int, list[str]] = {
+    9998: ["Read", "Write", "WebSearch", "mcp__mycroft__*", "mcp__email__*"],
+    9997: ["Read", "Write", "mcp__mycroft__curation_*"],
+}
+
+
+def _tool_name_in_grant(name: str, grant: list[str]) -> bool:
+    for entry in grant:
+        if entry.endswith("*"):
+            if name.startswith(entry[:-1]):
+                return True
+        elif name == entry:
+            return True
+    return False
+
+
+def _find_session_transcripts(session_id: str) -> list[Path]:
+    """Locate a session's top-level transcript(s) under ``~/.claude/projects/*/``.
+
+    Never assume a fixed project directory (port 9999 has no
+    ``WorkingDirectory`` and lands under ``~/.claude/projects/-/`` — see
+    System State). Returns every match; caller picks most-recent on >1.
+    """
+    root = Path("~/.claude/projects").expanduser()
+    if not root.is_dir():
+        return []
+    return sorted(root.glob(f"*/{session_id}.jsonl"))
+
+
+def _find_subagent_transcripts(session_id: str) -> list[Path]:
+    root = Path("~/.claude/projects").expanduser()
+    if not root.is_dir():
+        return []
+    return sorted(root.glob(f"*/{session_id}/subagents/*.jsonl"))
+
+
+def _extract_tool_calls_from_jsonl(path: Path) -> list[tuple[str, bool]]:
+    """Return ``(tool_name, denied)`` pairs found in one transcript file.
+
+    Malformed/truncated lines are skipped, not fatal — same per-line
+    tolerance as ``parse_full_output_records``.
+    """
+    out: list[tuple[str, bool]] = []
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        message = rec.get("message") or {}
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            name = block.get("name")
+            if not isinstance(name, str) or not name:
+                continue
+            denied = bool(rec.get("permission_denial") or block.get("permission_denial"))
+            out.append((name, denied))
+    return out
+
+
+def collect_session_tool_names(session_id: str) -> tuple[list[tuple[str, bool]], str]:
+    """Locate *session_id*'s transcript(s) (top-level + subagents) and
+    extract ``(tool_name, denied)`` pairs, unioned across all matches.
+
+    Returns ``(calls, lookup_status)`` where *lookup_status* is one of
+    ``"ok"``, ``"not_found"`` — the caller maps an empty ``session_id`` to
+    ``"skipped_no_session_id"`` before ever calling this (see Failure
+    Handling: that case must not run a filesystem search at all).
+    """
+    matches = _find_session_transcripts(session_id)
+    if not matches:
+        return [], "not_found"
+    if len(matches) > 1:
+        chosen = max(matches, key=lambda p: p.stat().st_mtime)
+        log.warning(
+            "proxy_trace.multiple_session_matches",
+            session_id=session_id,
+            paths=[str(m) for m in matches],
+        )
+    else:
+        chosen = matches[0]
+
+    calls = _extract_tool_calls_from_jsonl(chosen)
+    for sub_path in _find_subagent_transcripts(session_id):
+        calls.extend(_extract_tool_calls_from_jsonl(sub_path))
+    return calls, "ok"
+
 # Tracks the debug log's byte size as of the last `sync_proxy_trace_verdicts`
 # call, keyed by resolved path string. Lets that function tell "the log grew
 # but nothing parsed out of it" (upstream format drift — worth a warning)
@@ -207,6 +313,29 @@ def verdict_row_from_record(
         evidence.append(f"total_cost_usd={record['total_cost_usd']}")
     if record.get("stop_reason"):
         evidence.append(f"stop_reason={record['stop_reason']}")
+
+    # Per-tool-call name visibility (computed at first-INSERT time only —
+    # upsert_intent_verdict's ON CONFLICT clause silently drops `evidence`
+    # on any later UPDATE, see module docstring / Scope in the task spec).
+    if not session_id:
+        evidence.append("tool_names_lookup=skipped_no_session_id")
+    else:
+        calls, lookup_status = collect_session_tool_names(session_id)
+        if lookup_status == "not_found":
+            evidence.append("tool_names_lookup=not_found")
+        else:
+            names = sorted({name for name, _denied in calls})
+            evidence.append(f"tool_names={json.dumps(names)}")
+            denied_names = sorted({name for name, denied in calls if denied})
+            if denied_names:
+                evidence.append(f"denied_tool_names={json.dumps(denied_names)}")
+            grant = PORT_ALLOWED_TOOLS.get(port)
+            if grant is not None:
+                unexpected = sorted(n for n in names if not _tool_name_in_grant(n, grant))
+                for name in unexpected:
+                    evidence.append(f"UNEXPECTED_TOOL:{name}")
+                if unexpected:
+                    risk_level, recommendation = "high", "review"
 
     intent_summary = (
         f"Proxied claude-subscription session via port {port}: "
@@ -306,6 +435,13 @@ def sync_proxy_trace_verdicts(storage: Any, *, alias: str, base_url: str) -> int
 
     count = 0
     for record in records:
+        # Cheap dedup key, computed WITHOUT calling verdict_row_from_record
+        # (which now does a filesystem glob for tool names) — checking
+        # known_ids first is required so an already-processed record never
+        # re-globs ~/.claude/projects/*/ on every 30s poll tick forever.
+        verdict_key = record.get("uuid") or record.get("session_id") or ""
+        if f"proxytrace-{verdict_key}" in known_ids:
+            continue
         row = verdict_row_from_record(record, alias=alias, port=port)
         if row["verdict_id"] in known_ids:
             continue

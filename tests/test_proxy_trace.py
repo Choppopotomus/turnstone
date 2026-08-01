@@ -189,3 +189,126 @@ def test_sync_warns_when_log_grows_with_only_unparseable_content(tmp_path: Path,
     assert len(warnings) == 1
     assert warnings[0]["path"].endswith("claude-proxy-8934-debug.log")
     assert warnings[0]["current_size"] > warnings[0]["previous_size"]
+
+
+# ---------------------------------------------------------------------------
+# Per-tool-call name visibility (TASKSPEC_close_mcp_tool_visibility_gap.md)
+# ---------------------------------------------------------------------------
+
+
+def _write_transcript(path: Path, tool_calls: list[tuple[str, bool]]) -> None:
+    """Write a minimal Claude-Code-shaped JSONL transcript: one line per
+    tool_use block, ``(name, denied)`` pairs."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for name, denied in tool_calls:
+        rec: dict[str, Any] = {
+            "message": {"content": [{"type": "tool_use", "name": name}]}
+        }
+        if denied:
+            rec["permission_denial"] = True
+        lines.append(json.dumps(rec))
+    path.write_text("\n".join(lines) + "\n")
+
+
+def test_collect_session_tool_names_top_level(tmp_path: Path, monkeypatch) -> None:
+    project_dir = tmp_path / "-Users-c-Claude"
+    _write_transcript(project_dir / "sess-1.jsonl", [("Bash", False), ("Read", False)])
+    monkeypatch.setattr(
+        proxy_trace, "_find_session_transcripts",
+        lambda sid: sorted((tmp_path / "-Users-c-Claude").glob(f"{sid}.jsonl")),
+    )
+    monkeypatch.setattr(proxy_trace, "_find_subagent_transcripts", lambda sid: [])
+    calls, status = proxy_trace.collect_session_tool_names("sess-1")
+    assert status == "ok"
+    assert {n for n, _ in calls} == {"Bash", "Read"}
+
+
+def test_collect_session_tool_names_merges_subagent_transcripts(tmp_path: Path, monkeypatch) -> None:
+    top = tmp_path / "sess-2.jsonl"
+    sub = tmp_path / "sess-2" / "subagents" / "agent-abc.jsonl"
+    _write_transcript(top, [("Bash", False)])
+    _write_transcript(sub, [("mcp__mycroft__career_upsert_application", False)])
+    monkeypatch.setattr(proxy_trace, "_find_session_transcripts", lambda sid: [top])
+    monkeypatch.setattr(proxy_trace, "_find_subagent_transcripts", lambda sid: [sub])
+    calls, status = proxy_trace.collect_session_tool_names("sess-2")
+    assert status == "ok"
+    names = {n for n, _ in calls}
+    assert names == {"Bash", "mcp__mycroft__career_upsert_application"}
+
+
+def test_collect_session_tool_names_not_found(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(proxy_trace, "_find_session_transcripts", lambda sid: [])
+    monkeypatch.setattr(proxy_trace, "_find_subagent_transcripts", lambda sid: [])
+    calls, status = proxy_trace.collect_session_tool_names("sess-missing")
+    assert calls == []
+    assert status == "not_found"
+
+
+def test_verdict_row_skips_lookup_when_session_id_absent(monkeypatch) -> None:
+    called = {"n": 0}
+
+    def _boom(sid: str) -> Any:
+        called["n"] += 1
+        return [], "ok"
+
+    monkeypatch.setattr(proxy_trace, "collect_session_tool_names", _boom)
+    record = json.loads(_full_output_line(session_id="", uuid="").split(": ", 1)[1])
+    row = proxy_trace.verdict_row_from_record(record, alias="claude-subscription", port=9998)
+    assert called["n"] == 0
+    evidence = json.loads(row["evidence"])
+    assert "tool_names_lookup=skipped_no_session_id" in evidence
+
+
+def test_verdict_row_records_not_found_when_no_transcript(monkeypatch) -> None:
+    monkeypatch.setattr(proxy_trace, "collect_session_tool_names", lambda sid: ([], "not_found"))
+    record = json.loads(_full_output_line(session_id="sess-x", uuid="uuid-x").split(": ", 1)[1])
+    row = proxy_trace.verdict_row_from_record(record, alias="claude-subscription", port=9998)
+    evidence = json.loads(row["evidence"])
+    assert "tool_names_lookup=not_found" in evidence
+
+
+def test_verdict_row_flags_unexpected_tool_and_escalates_risk(monkeypatch) -> None:
+    monkeypatch.setattr(
+        proxy_trace,
+        "collect_session_tool_names",
+        lambda sid: ([("Read", False), ("mcp__unknown__frob", False)], "ok"),
+    )
+    record = json.loads(
+        _full_output_line(session_id="sess-y", uuid="uuid-y", num_turns=1).split(": ", 1)[1]
+    )
+    row = proxy_trace.verdict_row_from_record(record, alias="claude-subscription", port=9998)
+    evidence = json.loads(row["evidence"])
+    assert "UNEXPECTED_TOOL:mcp__unknown__frob" in evidence
+    assert row["risk_level"] == "high"
+    assert row["recommendation"] == "review"
+
+
+def test_malformed_transcript_line_skipped(tmp_path: Path) -> None:
+    path = tmp_path / "sess-z.jsonl"
+    good = json.dumps({"message": {"content": [{"type": "tool_use", "name": "Bash"}]}})
+    path.write_text("not valid json\n" + good + "\n")
+    calls = proxy_trace._extract_tool_calls_from_jsonl(path)
+    assert calls == [("Bash", False)]
+
+
+def test_sync_does_not_call_transcript_search_for_known_id(tmp_path: Path, fake_log, monkeypatch) -> None:
+    """Regression guard: reordering known_ids ahead of verdict_row_from_record
+    must stop the filesystem glob from re-running on already-seen records."""
+    calls = {"n": 0}
+
+    def _spy(sid: str) -> Any:
+        calls["n"] += 1
+        return [], "not_found"
+
+    monkeypatch.setattr(proxy_trace, "collect_session_tool_names", _spy)
+
+    storage = _FakeStorage()
+    text = _full_output_line(session_id="sess-known", uuid="uuid-known")
+    _sync(tmp_path, text, storage)  # first tick: new record, glob runs once
+    assert calls["n"] == 1
+
+    calls["n"] = 0
+    count = _sync(tmp_path, text, storage)  # second tick: identical content
+    assert count == 0
+    assert calls["n"] == 0  # must NOT re-glob an already-known verdict_id

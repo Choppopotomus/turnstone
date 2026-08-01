@@ -131,6 +131,16 @@ def build_verdict_payload(vrow: dict[str, Any]) -> dict[str, Any]:
     judge_model = vrow.get("judge_model") or ""
     if judge_model:
         payload["judge_model"] = judge_model
+    # Surface only the UNEXPECTED_TOOL:<name> subset of `evidence` — the
+    # risk-bearing signal from proxy_trace.py's grant-conformance check.
+    # The full per-session tool-name list stays pointer-only (Does NOT do).
+    unexpected_tools = [
+        e.split(":", 1)[1]
+        for e in _decode_json_list(vrow.get("evidence"))
+        if isinstance(e, str) and e.startswith("UNEXPECTED_TOOL:")
+    ]
+    if unexpected_tools:
+        payload["unexpected_tools"] = unexpected_tools
     return payload
 
 

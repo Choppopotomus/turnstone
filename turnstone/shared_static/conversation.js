@@ -604,6 +604,13 @@ export function buildConvVerdict(verdict, opts) {
     badge.appendChild(conf);
   }
 
+  if (verdict.unexpected_tools && verdict.unexpected_tools.length) {
+    const warn = document.createElement("span");
+    warn.className = "conv-verdict-unexpected-tools";
+    warn.textContent = "⚠ unexpected: " + verdict.unexpected_tools.join(", ");
+    badge.appendChild(warn);
+  }
+
   if (opts.judgePending) badge.appendChild(_convSpinner());
 
   const hasDetail = !!(
