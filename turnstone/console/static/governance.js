@@ -3779,6 +3779,7 @@ function switchJudgeSection(section) {
 function loadJudgeTab() {
   loadJudgeHeuristicRules();
   loadJudgeOGPatterns();
+  loadJudgeProxyTrace();
   // Load model definitions before settings (settings render needs the model list)
   authFetch("/v1/api/admin/model-definitions")
     .then(function (r) {
@@ -3794,6 +3795,106 @@ function loadJudgeTab() {
     .finally(function () {
       loadJudgeSettings();
     });
+}
+
+// -- Proxy Trace section -----------------------------------------------------
+// Minimal dashboard surface for tier="proxy_trace" verdicts (session-level,
+// from claude_proxy.py sessions) -- these never attach to a real workstream's
+// tool_calls, so they never reach the normal per-call judge decoration on
+// GET /history (see history_decoration.py's build_verdict_payload). This is
+// the one place an operator can actually see them, including the
+// UNEXPECTED_TOOL grant-conformance flag. No new backend endpoint: reuses
+// the existing (previously orphaned) GET /v1/api/admin/verdicts, filtering
+// to tier="proxy_trace" client-side since the storage layer has no tier
+// filter and adding one is unwarranted for a handful of rows.
+function loadJudgeProxyTrace() {
+  authFetch("/v1/api/admin/verdicts?limit=500")
+    .then(function (r) {
+      if (!r.ok) throw new Error("Failed");
+      return r.json();
+    })
+    .then(function (d) {
+      const rows = (d.verdicts || []).filter(function (v) {
+        return v.tier === "proxy_trace";
+      });
+      _renderJudgeProxyTrace(rows);
+    })
+    .catch(function () {
+      setSafeHtml(
+        document.getElementById("judge-proxy-trace-table-container"),
+        '<div class="dashboard-empty">Failed to load proxy trace verdicts</div>',
+      );
+    });
+}
+
+function _unexpectedToolsFromEvidence(evidenceRaw) {
+  let evidence = [];
+  try {
+    evidence = JSON.parse(evidenceRaw || "[]");
+  } catch (e) {
+    return [];
+  }
+  if (!Array.isArray(evidence)) return [];
+  const out = [];
+  for (let i = 0; i < evidence.length; i++) {
+    const e = evidence[i];
+    if (typeof e === "string" && e.indexOf("UNEXPECTED_TOOL:") === 0) {
+      out.push(e.slice("UNEXPECTED_TOOL:".length));
+    }
+  }
+  return out;
+}
+
+function _renderJudgeProxyTrace(rows) {
+  const el = document.getElementById("judge-proxy-trace-table-container");
+  if (!rows.length) {
+    setSafeHtml(el, '<div class="dashboard-empty">No proxy trace verdicts</div>');
+    return;
+  }
+  let html = "";
+  for (let i = 0; i < rows.length; i++) {
+    const v = rows[i];
+    const unexpected = _unexpectedToolsFromEvidence(v.evidence);
+    const riskCls =
+      "audit-badge" +
+      (v.risk_level === "high"
+        ? " audit-danger"
+        : v.risk_level === "low"
+          ? " audit-success"
+          : "");
+    html +=
+      '<div class="admin-row" role="listitem">' +
+      '<span class="admin-col admin-col-atime" title="' +
+      escapeHtml(v.created || "") +
+      '">' +
+      escapeHtml(v.created ? _relativeTime(v.created) : "—") +
+      "</span>" +
+      '<span class="admin-col">' +
+      escapeHtml(v.ws_id || "—") +
+      "</span>" +
+      '<span class="admin-col admin-col-hrisk"><span class="' +
+      riskCls +
+      '">' +
+      escapeHtml(v.risk_level || "") +
+      "</span></span>" +
+      '<span class="admin-col admin-col-hrec">' +
+      escapeHtml(v.recommendation || "") +
+      "</span>" +
+      '<span class="admin-col">' +
+      (unexpected.length
+        ? '<span class="audit-badge audit-danger">' +
+          escapeHtml(unexpected.join(", ")) +
+          "</span>"
+        : "—") +
+      "</span>" +
+      '<span class="admin-col" title="' +
+      escapeHtml(v.call_id || "") +
+      '">' +
+      escapeHtml((v.call_id || "").slice(0, 12)) +
+      "</span>" +
+      "</div>";
+  }
+  setSafeHtml(el, html);
 }
 
 // -- Settings section -------------------------------------------------------

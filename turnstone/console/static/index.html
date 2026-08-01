@@ -625,6 +625,18 @@
                 >
                   Output Guard
                 </button>
+                <button
+                  id="judge-tab-proxy-trace"
+                  class="admin-subtab-btn"
+                  role="tab"
+                  aria-selected="false"
+                  aria-controls="judge-proxy-trace-section"
+                  tabindex="-1"
+                  data-section="judge-proxy-trace"
+                  onclick="switchJudgeSection('judge-proxy-trace')"
+                >
+                  Proxy Trace
+                </button>
               </div>
 
               <!-- Settings section -->
@@ -713,6 +725,40 @@
                   aria-live="polite"
                 >
                   <div class="dashboard-empty">Loading patterns...</div>
+                </div>
+              </div>
+
+              <!-- Proxy Trace section -->
+              <div
+                id="judge-proxy-trace-section"
+                class="judge-section"
+                role="tabpanel"
+                aria-labelledby="judge-tab-proxy-trace"
+                style="display: none"
+              >
+                <div class="admin-toolbar" style="margin-bottom: 12px">
+                  <span style="font-size: 13px; color: var(--fg-dim)"
+                    >Session-level verdicts from claude_proxy.py sessions
+                    (Poe/council/etc.) — retrospective, not a live gate. Tool
+                    names outside a port's configured grant are flagged
+                    UNEXPECTED.</span
+                  >
+                </div>
+                <div class="admin-colheaders" aria-hidden="true">
+                  <span class="admin-col admin-col-atime">TIME</span>
+                  <span class="admin-col">WORKSTREAM</span>
+                  <span class="admin-col admin-col-hrisk">RISK</span>
+                  <span class="admin-col admin-col-hrec">REC.</span>
+                  <span class="admin-col">UNEXPECTED TOOLS</span>
+                  <span class="admin-col">SESSION ID</span>
+                </div>
+                <div
+                  id="judge-proxy-trace-table-container"
+                  role="list"
+                  aria-label="Proxy trace verdicts"
+                  aria-live="polite"
+                >
+                  <div class="dashboard-empty">Loading verdicts...</div>
                 </div>
               </div>
             </div>

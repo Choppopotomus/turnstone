@@ -1880,6 +1880,11 @@ h3.skill-spec-heading {
 #judge-output-guard-section .admin-row {
   grid-template-columns: 1.2fr 120px 60px 100px 90px 60px 170px;
 }
+/* Judge: Proxy Trace grid — TIME | WORKSTREAM | RISK | REC. | UNEXPECTED TOOLS | SESSION ID */
+#judge-proxy-trace-section .admin-colheaders,
+#judge-proxy-trace-section .admin-row {
+  grid-template-columns: 90px 110px 70px 90px 1fr 130px;
+}
 
 /* Audit action badges */
 .audit-badge {
