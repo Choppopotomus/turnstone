@@ -23,15 +23,16 @@ The recipe (verified end-to-end) has four load-bearing pieces:
    every SSE event enqueued" barrier (``stream_end`` is per-LLM-call, not
    per-turn, so it is NOT a completion marker).
 
-4. **Thread hygiene.** ``create_app``'s lifespan unconditionally starts
-   two daemon fan-out threads (``_global_fanout_thread`` blocking on
-   ``global_queue.get()``, ``_aggregate_emitter_thread`` on a 10s loop)
-   with no shutdown sentinel — they would trip conftest's leaked-thread
-   guard. They serve the cluster/global lane, which the per-ws ``/events``
-   path under test never touches, so the harness swaps them for no-ops
-   before boot (restored on ``stop``). The result is a fully clean
-   teardown — no ``allow_thread_leak`` needed — with the real per-ws SSE
-   engine fully intact.
+4. **Thread hygiene.** ``create_app``'s lifespan starts daemon fan-out
+   threads (``_global_fanout_thread`` blocking on ``global_queue.get()``,
+   ``_aggregate_emitter_thread`` on a 10s loop).  The harness used to
+   swap them for no-ops (they had no shutdown and tripped conftest's
+   leaked-thread guard), which kept the global lane dead here; #885 gave
+   the lifespan a real shutdown (stop Event + a queue sentinel for the
+   fanout, joined in the lifespan exit that ``stop()``'s
+   ``should_exit``/join drives), so the harness now runs them REAL — the
+   ``roster-restart`` scenario depends on a live global lane — and
+   teardown stays clean with no ``allow_thread_leak``.
 """
 
 from __future__ import annotations
@@ -49,7 +50,6 @@ from typing import TYPE_CHECKING, Any
 import httpx
 import uvicorn
 
-import turnstone.server as tsrv
 from tests._session_helpers import scripted_chat_client
 from turnstone.core.adapters.interactive_adapter import InteractiveAdapter
 from turnstone.core.auth import JWT_AUD_SERVER, create_jwt
@@ -62,6 +62,8 @@ from turnstone.prompts import ClientType
 from turnstone.server import WebUI, create_app
 
 if TYPE_CHECKING:
+    from collections.abc import MutableMapping
+
     from turnstone.core.workstream import Workstream
 
 _JWT_SECRET = "sse-recovery-e2e-jwt-secret-minimum-32-chars!"
@@ -69,17 +71,6 @@ _JWT_SECRET = "sse-recovery-e2e-jwt-secret-minimum-32-chars!"
 # the listener-queue poison stays bounded (paired with the client's small
 # SO_RCVBUF in _sse_recovery_helpers). Harmless for prompt readers.
 _DEFAULT_SNDBUF = 8192
-
-
-def _noop_thread(*_args: object, **_kwargs: object) -> None:
-    """Stand-in for the cluster-lane daemon threads (see module docstring)."""
-
-
-# The REAL daemon-thread factories, captured once at import so restore always
-# targets them regardless of how many servers neuter/restore in a run (the
-# restart scenarios build a second server before the run ends).
-_REAL_FANOUT = tsrv._global_fanout_thread
-_REAL_AGGREGATE = tsrv._aggregate_emitter_thread
 
 
 def _fake_client(scripts: tuple[Any, ...]) -> Any:
@@ -101,6 +92,7 @@ class RecoveryServer:
         listener_cap: int | None = None,
         extra_routes: list[Any] | None = None,
         port: int = 0,
+        sock: socket.socket | None = None,
     ) -> None:
         self._global_queue: _q.Queue[dict[str, Any]] = _q.Queue(maxsize=100000)
         self._global_listeners: list[_q.Queue[dict[str, Any]]] = []
@@ -158,9 +150,35 @@ class RecoveryServer:
         self._adapter.attach(self._manager)
         WebUI._workstream_mgr = self._manager
 
-        # Neuter the cluster-lane daemons for a clean teardown (see docstring).
-        tsrv._global_fanout_thread = _noop_thread
-        tsrv._aggregate_emitter_thread = _noop_thread
+        # delay_load knob state (see the method): wraps the storage
+        # singleton's load_messages; restored in stop().
+        self._load_delay_ms = 0
+        self._load_calls = 0
+        # load_messages runs on asyncio.to_thread WORKERS, and delay_load
+        # exists precisely to overlap two of them — unlike the
+        # single-writer HTTP counters, this one has genuine concurrent
+        # writers, so the increment takes a lock (a lost update would
+        # false-FAIL G7's load_delta === 2, or mask a third load).
+        self._load_calls_lock = threading.Lock()
+        _storage_obj = get_storage()
+        self._orig_load_messages = _storage_obj.load_messages
+
+        def _delayed_load(*a: Any, **k: Any) -> Any:
+            with self._load_calls_lock:
+                self._load_calls += 1
+            result = self._orig_load_messages(*a, **k)
+            # Sleep AFTER the load: the held flight must hold the data it
+            # actually read (its transaction point), so a flight parked
+            # across a rewind genuinely carries PRE-rewind rows — a
+            # pre-load sleep would read post-rewind storage and mask a
+            # wrongly-joined flight as fresh truth.
+            d = self._load_delay_ms
+            if d > 0:
+                time.sleep(d / 1000.0)
+            return result
+
+        _storage_obj.load_messages = _delayed_load  # type: ignore[method-assign]
+        self._patched_storage = _storage_obj
 
         # Optional small listener-queue cap. The cap is a default arg on the
         # registration methods with no config/env override, so lower it by
@@ -195,15 +213,123 @@ class RecoveryServer:
             self._app.router.routes.extend(extra_routes)
 
         # Pre-bind a listening socket with a small SO_SNDBUF (accepted conns
-        # inherit it), then hand it to uvicorn.
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
-        self._sock.bind(("127.0.0.1", port))  # port=0 -> ephemeral; fixed -> restart reuse
+        # inherit it), then hand it to uvicorn.  ``sock`` injection: the
+        # gap-free restart scenarios (roster-restart-native) bind a
+        # placeholder BEFORE stopping the prior node and hand it in here —
+        # a failed EventSource reconnect attempt is TERMINAL per WHATWG
+        # (fail-the-connection → CLOSED, no further retries), so the
+        # native-retry leg must never observe a refused-window; the
+        # placeholder's listen backlog completes the TCP handshake during
+        # the boot and uvicorn drains it once serving.
+        self._sock = sock if sock is not None else make_listen_socket(port, sndbuf=sndbuf)
         self._port = int(self._sock.getsockname()[1])
-        self._sock.listen(128)
 
-        self._server = uvicorn.Server(uvicorn.Config(self._app, log_level="warning", lifespan="on"))
+        # -- fault injection (public knobs below) ----------------------------
+        # In-process arming: the Tier-2 runner holds this RecoveryServer and
+        # arms a knob, THEN drives the browser request that consumes it.
+        # Single-writer by construction — the runner never arms a knob while
+        # the loop thread is mid-consume — and CPython makes each int read /
+        # write atomic, so these need no lock even though the uvicorn loop
+        # thread increments/decrements them while the runner thread reads.
+        self.history_requests = 0
+        # /history responses the PRODUCTION route answered 200 (not the
+        # fault layer's injected 500s).  See _fault_app for why arrival
+        # counting cannot substitute.
+        self.history_ok = 0
+        self.rewind_requests = 0
+        # Per-ws SSE connection opens (``GET …/events`` — the EventSource the
+        # pane's connectSSE builds).  A TRANSPORT-FREE heal (the #890 idle-edge
+        # staleness backstop, a quiesced REST refetch) must leave this FLAT; a
+        # reload-based backstop would bump it once per reconnect (the round-5
+        # storm).  Same lock-free single-writer int discipline as above.
+        self.events_requests = 0
+        # Global-lane SSE connection opens (``GET …/events/global`` — the
+        # roster stream app.js's connectGlobalSSE builds).  The
+        # roster-restart scenario (#881) asserts the post-restart manual
+        # reconnect actually reached the reborn node's real endpoint.
+        self.global_events_requests = 0
+        self._history_fail_remaining = 0
+        self._history_delay_ms = 0
+        # A thin pure-ASGI fault layer wrapping the REAL app (the production
+        # app itself is untouched): count + optionally delay/fail
+        # ``GET …/history``, count ``POST …/rewind``, count each per-ws SSE
+        # connection open (``GET …/events``), forward everything else (SSE
+        # bodies, /send, lifespan, static) verbatim.
+        production_app = self._app
+
+        async def _fault_app(scope: dict[str, Any], receive: Any, send: Any) -> None:
+            if scope.get("type") == "http":
+                path = scope.get("path", "")
+                method = scope.get("method", "")
+                if path.endswith("/history") and method == "GET":
+                    # ARRIVAL, never move.  Scenarios that hold a request open
+                    # use this bump as the IN-FLIGHT edge (E6/E7/G1/G7 say so
+                    # at their poll sites); counting on forward instead would
+                    # delay it past the hold and silently stop those scenarios
+                    # testing anything.
+                    self.history_requests += 1
+                    if self._history_delay_ms > 0:
+                        await asyncio.sleep(self._history_delay_ms / 1000.0)
+                    if self._history_fail_remaining > 0:
+                        self._history_fail_remaining -= 1
+                        await send(
+                            {
+                                "type": "http.response.start",
+                                "status": 500,
+                                "headers": [(b"content-type", b"application/json")],
+                            }
+                        )
+                        await send({"type": "http.response.body", "body": b'{"error": "injected"}'})
+                        return
+
+                    # Successful-RESPONSE counter, distinct from the arrival
+                    # bump above.  A scenario asserting that a render was
+                    # DECLINED needs to know a good payload actually existed —
+                    # otherwise "the client refused to render" and "there was
+                    # nothing to render" produce identical observables (no
+                    # wipe, latch held).  Arrival cannot prove that, and
+                    # neither can an injected-fail budget: a PRODUCTION-side
+                    # 500/404 would slip through both.  Reading the real
+                    # status off the response start is the only honest signal.
+                    async def _counting_send(message: MutableMapping[str, Any]) -> None:
+                        if (
+                            message.get("type") == "http.response.start"
+                            and message.get("status") == 200
+                        ):
+                            self.history_ok += 1
+                        await send(message)
+
+                    await production_app(scope, receive, _counting_send)
+                    return
+                elif path.endswith("/rewind") and method == "POST":
+                    self.rewind_requests += 1
+                elif path.endswith("/events") and method == "GET":
+                    # Per-ws SSE connection open — count it (readable on
+                    # RecoveryServer) and forward the long-lived stream
+                    # verbatim below.  Uniquely the per-ws stream: the global
+                    # lane is ``…/events/global`` (ends ``/global``), and the
+                    # route the pane's EventSource hits is
+                    # ``…/workstreams/{ws_id}/events`` (session_routes).
+                    self.events_requests += 1
+                elif path.endswith("/events/global") and method == "GET":
+                    self.global_events_requests += 1
+            await production_app(scope, receive, send)
+
+        # ``timeout_graceful_shutdown``: an SSE stream that is still open
+        # at ``stop()`` would otherwise park uvicorn's graceful drain
+        # indefinitely (the 20s thread-join just expires and the browser
+        # stays attached to the zombie server — the roster-restart-native
+        # scenario is the one caller that stops a node mid-stream).  A
+        # bounded drain force-closes the stream after 2s and the lifespan
+        # shutdown (#885's daemon-thread teardown) still runs after it.
+        self._server = uvicorn.Server(
+            uvicorn.Config(
+                _fault_app,
+                log_level="warning",
+                lifespan="on",
+                timeout_graceful_shutdown=2,
+            )
+        )
         self._thread = threading.Thread(
             target=self._serve, name=f"uvicorn-recovery-{self._port}", daemon=True
         )
@@ -342,24 +468,113 @@ class RecoveryServer:
         result: dict[str, Any] = r.json()
         return result
 
+    # -- fault-injection knobs -----------------------------------------------
+    # Armed in-process by the Tier-2 runner (single writer at a time — see
+    # __init__).  A plain int is deliberate: CPython makes the loop thread's
+    # increment/decrement and the runner thread's read each atomic, and the
+    # arm-then-consume ordering means they never race.
+
+    def delay_load(self, ms: int) -> None:
+        """Hold ``storage.load_messages`` itself open for ``ms`` (0 = off).
+
+        ``delay_history`` sleeps in the FAULT LAYER — before the route —
+        so two delayed requests never overlap inside the #884 flight
+        machinery (the first flight completes and pops before the second
+        arrives at the route).  This knob sleeps INSIDE the shared
+        reconstruction's ``load_messages`` (sync, called via
+        ``asyncio.to_thread`` — the sleep parks only that worker), which
+        is the same layer the unit tests gate, so held flights genuinely
+        overlap and join/miss behavior is observable end to end via
+        ``load_calls``.
+        """
+        self._load_delay_ms = ms
+
+    @property
+    def load_calls(self) -> int:
+        """``load_messages`` entries (pre-sleep) — the flight-layer twin
+        of ``history_requests`` (which counts HTTP arrivals): a JOINED
+        request never enters ``load_messages``, so join=1 / miss=2."""
+        return self._load_calls
+
+    def fail_history(self, count: int) -> None:
+        """Make the next ``count`` ``GET …/history`` responses a 500 — the
+        failed refetch the #890 guard-before-wipe must survive."""
+        self._history_fail_remaining = count
+
+    def delay_history(self, ms: int) -> None:
+        """Hold each ``GET …/history`` ``ms`` ms before forwarding (0
+        clears).  Opens the clear_ui-refetch quiesce window that the row
+        affordance gate (``busy || _historyStale``) must close."""
+        self._history_delay_ms = ms
+
+    @property
+    def history_fail_remaining(self) -> int:
+        """Unconsumed forced-failure budget — 0 proves the armed failure
+        actually fired (assert backend state, never scripted absence)."""
+        return self._history_fail_remaining
+
     # -- teardown ------------------------------------------------------------
 
-    def stop(self) -> None:
-        with contextlib.suppress(Exception):
-            for ws in list(self._manager.list_all()):
-                with contextlib.suppress(Exception):
-                    self._manager.close(ws.id)
+    def stop(self, *, hard: bool = False) -> None:
+        """Stop the node.
+
+        ``hard=True`` skips the per-workstream ``manager.close`` sweep — a
+        graceful close routes through ``cleanup_session_ui`` →
+        ``session.cancel()``, whose bash cancel path PERSISTS a
+        synthesized "Cancelled by user" result while the old node is
+        still alive, which masks crash states.  A hard stop leaves any
+        in-flight tool call genuinely unresulted in storage, modelling a
+        SIGKILL/OOM death (the coord-orphan-rewind scenario's premise).
+        The 2s graceful-shutdown timeout (uvicorn config) force-closes
+        open SSE streams, and the lifespan teardown still runs, so the
+        #885 daemon threads are joined on both paths.
+        """
+        if not hard:
+            with contextlib.suppress(Exception):
+                for ws in list(self._manager.list_all()):
+                    with contextlib.suppress(Exception):
+                        self._manager.close(ws.id)
+        # hard=True relies on ``timeout_graceful_shutdown=2`` (set in the
+        # uvicorn config above) to force-close the pane's EventSource:
+        # should_exit alone still runs the ASGI lifespan teardown, so the
+        # #885 daemon threads and the sse_executor are joined either way
+        # (``force_exit`` would SKIP the lifespan and leak them — the
+        # fanout thread blocks on queue.get() forever).  NOTE: the killed
+        # workstream's in-flight tool keeps executing on this process's
+        # session thread and persists its result at natural completion —
+        # hard-kill scenarios must use a paced tool that outlives their
+        # observation window.
         self._server.should_exit = True
         self._thread.join(timeout=20)
         with contextlib.suppress(Exception):
             self._http.close()
         with contextlib.suppress(OSError):
             self._sock.close()
-        # Restore the cluster-lane daemon factories + any patched cap defaults.
-        tsrv._global_fanout_thread = _REAL_FANOUT
-        tsrv._aggregate_emitter_thread = _REAL_AGGREGATE
+        # Restore any patched cap defaults.
         for meth, defaults in self._orig_defaults:
             meth.__defaults__ = defaults
+        # Restore the storage singleton's load_messages (delay_load knob).
+        with contextlib.suppress(Exception):
+            self._patched_storage.load_messages = self._orig_load_messages  # type: ignore[method-assign]
+
+
+def make_listen_socket(port: int, *, sndbuf: int = _DEFAULT_SNDBUF) -> socket.socket:
+    """Bound + listening socket the way :class:`RecoveryServer` binds its own.
+
+    ``SO_REUSEPORT`` on every listener (same process, same uid) is what
+    lets a restart scenario bind the successor's socket while the prior
+    node still holds the port — the seam behind the gap-free handoff
+    documented at the ``sock`` parameter.  ``SO_SNDBUF`` matches the
+    server's small send buffer so accepted connections inherit identical
+    backpressure behavior regardless of which side bound the socket.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, sndbuf)
+    s.bind(("127.0.0.1", port))  # port=0 -> ephemeral; fixed -> restart reuse
+    s.listen(128)
+    return s
 
 
 def _tcp_ready(port: int, timeout: float) -> bool:

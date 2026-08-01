@@ -2093,9 +2093,11 @@ def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None
         body,
     ), "connectSSE must gate ?last_event_id= on connectCursor != null"
     # (2) cleared only by a successful full render — below the !hist guard,
-    # riding the wipe — and never by the teardown paths.
+    # riding the wipe — and never by the teardown paths.  (Sliced to the
+    # next function boundary; the invariant is the ORDER, not the
+    # density, and a char-count window rots as at-site comments grow.)
     start = body.index("async function refetchHistory(seedCursor = false)")
-    fn = body[start : start + 4500]
+    fn = body[start : body.index("\n  function ", start + 1)]
     guard = fn.index("if (!hist) return;")
     clear = fn.index("truncatedFromCursor = null;")
     assert guard < clear, "the record must only clear once a payload rendered"
@@ -2190,14 +2192,18 @@ def test_coord_truncated_resync_is_full_fresh_connect_with_churn_limit() -> None
     assert "console.warn(" in rec.group(1)
     # (9) repair-intent supersession lives in refetchHistory's success path
     # — record + deferred latch + pending timer, all below the !hist guard
-    # — and clear_ui carries no path-local cancel.
+    # — and clear_ui carries no path-local cancel of the TRUNCATED repair
+    # intent.  Pin the specific timer, not all clearTimeout: #894's
+    # staleRetryTimer re-arm cancel in clear_ui is the staleness latch's
+    # own machinery, deliberately armed there (see the coord latch-contract
+    # test), not a truncated-repair cancel.
     assert "pendingTruncatedResync = false;" in fn
     assert "clearTimeout(truncatedResyncTimer)" in fn
     assert guard < fn.index("pendingTruncatedResync = false;")
     assert guard < fn.index("clearTimeout(truncatedResyncTimer)")
     cu = re.search(r'case "clear_ui": \{(.*?)\n      \}', body, re.S)
     assert cu is not None, "clear_ui case not found"
-    assert "clearTimeout" not in cu.group(1)
+    assert "clearTimeout(truncatedResyncTimer)" not in cu.group(1)
 
 
 def test_coord_detects_server_restart_by_backwards_event_id() -> None:
@@ -2241,12 +2247,24 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
     every cursor guard keeps a future editor from "simplifying" the
     numeric ones to match a terser string form.
 
-    The GLOBAL stream (app.js) is the deliberate exception: its manual
-    reconnects are pinned CURSORLESS — the global ring's counter reboots
-    at 0 on restart (KNOWN GAP #881), so a stale cursor draws
-    ``replay_ok``-empty with no node_snapshot and the roster ghosts;
-    cursorless always draws the fresh snapshot.  Revisit when #881
-    lands.
+    The GLOBAL stream (app.js) was pinned CURSORLESS here until #881
+    landed its boot-epoch signal: global ids are now
+    ``"{boot_epoch}-{counter}"``, so a cursor from a prior boot
+    mismatches the live epoch and draws ``replay_truncated`` + a fresh
+    node_snapshot instead of the old ``replay_ok``-empty ghost-roster
+    shape — the reason for cursorlessness is gone, and app.js now
+    captures/presents the cursor like the per-ws clients.  Its cursor
+    stays an OPAQUE STRING end to end (never ``parseInt``/``Number``
+    — the epoch prefix would NaN any numeric read), presented via
+    ``?last_event_id=`` (EventSource cannot set the header manually),
+    and cleared where the record dies: the ``replay_truncated``
+    handler, the ``node_snapshot`` recovery floor (required, not
+    belt-and-braces — that id-less frame's MessageEvent inherits the
+    connection's stale pre-restart cursor on NATIVE reconnects, so the
+    pre-dispatch capture re-stores it and only a branch-level clear
+    kills it), and ``onLogout``.  All three clears are pinned below —
+    a simplify pass dropping one reintroduces the redundant
+    dead-cursor truncated round.
 
     Comments are stripped before the scan (module-level, string-aware
     stripper) so documentation may name the anti-pattern verbatim — the
@@ -2262,6 +2280,11 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
             _COORD_JS,
             r'if \(event\.lastEventId != null && event\.lastEventId !== ""\) \{',
         ),
+        (
+            _APP_JS,
+            r'if \(e\.lastEventId != null && e\.lastEventId !== ""\) \{\s*'
+            r"globalLastEventId = e\.lastEventId;",
+        ),
     ):
         body = path.read_text(encoding="utf-8")
         code = _strip_js_comments(body)
@@ -2275,14 +2298,40 @@ def test_sse_cursor_captured_from_message_event_never_the_source_object() -> Non
             '``!= null && !== ""`` guard) not found'
         )
     app_code = _strip_js_comments(_APP_JS.read_text(encoding="utf-8"))
-    assert not dead_form.search(app_code), (
-        "app.js: dead EventSource-object cursor read must not return"
+    # Presentation: manual reconnects carry the stored cursor as a query
+    # param, behind the same string-guard idiom (see docstring above for
+    # why the explicit form is pinned).
+    assert re.search(
+        r'if \(globalLastEventId != null && globalLastEventId !== ""\) \{\s*'
+        r'globalUrl \+= "\?last_event_id=" \+ encodeURIComponent\(globalLastEventId\);',
+        app_code,
+    ), (
+        "app.js: manual global reconnect must present the stored cursor "
+        "via ?last_event_id= behind the house string guard"
     )
-    assert "lastEventId" not in app_code and "last_event_id" not in app_code, (
-        "app.js global stream must stay CURSORLESS on manual reconnects "
-        "until #881's boot-epoch staleness signal lands — a stale cursor "
-        "on the reborn global ring draws replay_ok-empty with no "
-        "node_snapshot (ghost roster)."
+    # The cursor is opaque — any numeric interpretation of it is a bug
+    # (the epoch prefix turns Number()/parseInt() into NaN silently).
+    assert not re.search(r"(?:Number|parseInt)\(\s*globalLastEventId", app_code), (
+        "app.js: the global cursor is an opaque epoch-tagged string — "
+        "never interpret it numerically"
+    )
+    # Dead-record clears (see docstring): truncated envelope, snapshot
+    # recovery floor (BEFORE the roster rebuild), and logout.
+    assert re.search(
+        r"globalLastEventId = null;\s*resyncRoster\(\);",
+        app_code,
+    ), "app.js: the replay_truncated handler must clear the spent cursor"
+    assert re.search(
+        r"globalLastEventId = null;\s*applyRosterSnapshot\(",
+        app_code,
+    ), (
+        "app.js: the node_snapshot branch must clear the cursor — on "
+        "native reconnects this id-less frame re-captured the stale one"
+    )
+    logout_body = re.search(r"window\.onLogout = function \(\) \{(.*?)\n\};", app_code, re.S)
+    assert logout_body is not None, "app.js: window.onLogout not found"
+    assert "globalLastEventId = null;" in logout_body.group(1), (
+        "app.js: onLogout must reset the cursor (roster identity reset)"
     )
 
 
@@ -3348,3 +3397,28 @@ def test_reload_toast_console_phrasing_pins() -> None:
     assert '"Reload sent to console"' in js
     assert '"; console reload failed"' in js
     assert "!consoleFailed &&" in js
+
+
+def test_every_system_turn_source_has_a_fallback_label() -> None:
+    """``OPERATOR_SOURCE_LABELS`` must cover every SYSTEM_TURN_SOURCES
+    member, carded or not — a missing entry leaks the raw ``_source``
+    ("operator · idle_children").
+
+    Two routes reach the label: uncarded kinds (compaction_pending,
+    background_shell_exit, participant_joined) have no dispatch branch
+    and arrive on EVERY render; carded kinds arrive when a replayed
+    turn's persisted ``_source_meta`` is absent, because every card
+    dispatch is guarded on the turn carrying ``meta``.  ``compaction`` is
+    the one exception — handled first and unguarded in both panes.
+
+    Pinned as a set comparison rather than named entries so the next
+    source added to the Python vocabulary fails here instead of leaking
+    silently."""
+    from turnstone.core.tool_advisory import SYSTEM_TURN_SOURCES
+
+    root = Path(__file__).resolve().parent.parent
+    utils = (root / "turnstone/shared_static/utils.js").read_text(encoding="utf-8")
+    block = utils.split("const OPERATOR_SOURCE_LABELS = {", 1)[1].split("};", 1)[0]
+    labelled = {ln.split(":", 1)[0].strip() for ln in block.splitlines() if ":" in ln}
+    missing = set(SYSTEM_TURN_SOURCES) - labelled - {"compaction"}
+    assert not missing, f"system turn sources with no operator label: {sorted(missing)}"

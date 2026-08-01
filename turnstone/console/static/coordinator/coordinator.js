@@ -57,6 +57,8 @@ import {
   DEGRADED_COOLDOWN_MAX_MS,
   DEGRADED_COOLDOWN_RESET_MS,
   TRUNCATED_RESYNC_JITTER_MS,
+  STALE_RETRY_JITTER_MS,
+  STALE_RETRY_BASE_MS,
   overflowWindowTripped,
   degradedCooldownStep,
 } from "/shared/sse_overflow.js";
@@ -642,6 +644,76 @@ function createCoordinatorPane(root, wsId, opts) {
   // also catches a turn stranded by close-on-hide (finished while hidden, its
   // stream_end evicted before the show-edge reconnect).
   let pendingTruncatedResync = false;
+  // Transcript-staleness latch (#894, the port of interactive.js's #890
+  // _historyStale).  Set at clear_ui arrival — from that moment the visible
+  // transcript is the PRE-rewind one and no longer matches the server's
+  // restructured conversation — and cleared in EXACTLY ONE place:
+  // refetchHistory's success-path render.  It gates the DOM-counting
+  // affordances (_rewindToMessage / _editAndResend / _startEdit, via
+  // ``busy || historyStale``) so a turn count computed off the stale DOM
+  // can't reach POST /rewind during the refetch window OR after a failed
+  // refetch.  LATCH, not a refetch-in-flight flag: a flag reopens on the
+  // failed exit, which is exactly the over-rewind window (the bug
+  // interactive.js hit in its round-3 review).  Heals: one bounded
+  // turn-free retry armed by the clear_ui handler, then the idle-edge
+  // backstop in the state_change consumer — both plain REST refetches
+  // (TRANSPORT-FREE; the ruling lives at the backstop).
+  let historyStale = false;
+  // Count of refetchHistory calls currently awaiting /history.  The
+  // staleness heals (retry + backstop) read it to YIELD to any in-flight
+  // fetch — clear_ui's own, a sibling heal's, or a resync's — instead of
+  // stomping it with a same-snapshot double render.  Coord's quiesce-free
+  // substitute for interactive.js's !_replayQueue yield guard.  A COUNT,
+  // not a boolean: overlapping fetches are reachable (another actor's
+  // rewind can emit clear_ui while a heal fetch is in flight), and a
+  // boolean would clear on the first finisher's exit with a fetch still
+  // live.  Only the await window needs bracketing — the render after
+  // ``if (!hist)`` is synchronous, so no timer or SSE handler can observe
+  // the counter mid-render.
+  let refetchesInFlight = 0;
+  // Monotonic refetchHistory dispatch stamp.  Each call captures
+  // ``++refetchSeq`` before its await; the render-time gate discards any
+  // payload whose stamp is no longer current, so overlapping fetches
+  // (reachable via another actor's clear_ui racing a heal) resolve
+  // last-DISPATCH-wins deterministically instead of last-RESPONSE-wins —
+  // an older snapshot landing late can neither double-render nor clear
+  // the staleness latch over a newer truth.
+  let refetchSeq = 0;
+  // EVERY in-flight /history AbortController — destroy() aborts them all
+  // so a slow fetch cannot pin the destroyed pane's closure for the
+  // bound's full 15s (the same dead-not-inert ruling destroy() applies
+  // to staleRetryTimer).  A Set, not a single slot (r9): overlapping
+  // dispatches settle in any order, and a newest-wins slot nulled by
+  // the newer dispatch's finally left the OLDER fetch unabortable.
+  const histCtrls = new Set();
+  // call_ids of tool calls whose results are still ARRIVING ON THE LIVE
+  // STREAM — the render-time gate's tool-phase liveness signal.  Fed
+  // ONLY by live SSE events (tool_pending / tool_info add, tool_result
+  // deletes) and drained at the settle edge ONLY (state_change
+  // idle/error — a leftover id there is a dead call whose result will
+  // never come).  Retirement policy (r7): an id leaves on its RESULT,
+  // at the SETTLE edge, or with pane death — transport death is NOT a
+  // retirement event, because the reconnect replay does not re-announce
+  // a live batch (verified: replay_ok yields only events past the
+  // cursor; the fresh/truncated replay yields no tool_pending/tool_info)
+  // — a stale id fails CLOSED (skip, latch survives, settle heals),
+  // while an empty set fails OPEN into the wipe.  NEVER
+  // touched by any render: that is the r6 lesson — refetchHistory's own
+  // replay path paints orphan batches (committed tool_calls with no
+  // persisted result) with the same .conv-batch--running class the live
+  // path uses, and nothing ever strips a dead orphan's class, so a
+  // DOM-derived liveness probe would let one orphan paint poison every
+  // seedless heal for the life of the page (rewind/edit permanently
+  // dead).  Reachability ruling (r7, superseding r6's): the persisted
+  // orphan is REAL — a hard crash (SIGKILL/OOM) leaves the committed
+  // tool_calls turn genuinely unresulted; only a GRACEFUL close
+  // synthesizes the "Cancelled by user" result (session.cancel()), and
+  // boot rehydration synthesizes nothing (both verified empirically).
+  // The G6 harness scenario hard-kills a node and proves the seedless
+  // rewind renders THROUGH the painted residue.  Liveness is read from
+  // the channel that creates the hazard — the stream — never from DOM
+  // the render path can forge.
+  const liveToolCalls = new Set();
   // The cursor position a replay_truncated envelope was received AT — i.e.
   // "a gap of lost events exists BELOW this cursor".  Keep-oldest: set only
   // when null (repeated envelopes for the same unrepaired gap must not
@@ -707,6 +779,17 @@ function createCoordinatorPane(root, wsId, opts) {
   // stream — the next connect's own truncated envelope reschedules if the
   // gap still exists (truncatedFromCursor re-presents it).
   let truncatedResyncTimer = null;
+  // The ONE bounded clear_ui-failure retry (#894; mirrors interactive.js's
+  // _staleRetryTimer).  Armed only from the clear_ui handler's .then when
+  // the latch survived the refetch; never re-armed from its own firing
+  // (bounded by construction).  Cancelled by refetchHistory's success path
+  // and destroy() ONLY — deliberately NOT by closeStreamTransport beside
+  // the transport timers above: this is a REST-refetch timer, not a
+  // transport timer, and a transport-only redial (hide/show, degraded
+  // cooldown, reconnect backoff) must keep the pending heal intent alive.
+  // A firing after coordCloseSession no-ops via the visHandler fire-time
+  // guard.
+  let staleRetryTimer = null;
   let degradedCooldownMs = DEGRADED_COOLDOWN_BASE_MS;
   let lastDegradedAt = 0;
   // Close-on-hide / replay-on-show bookkeeping.  A hidden tab's throttled event
@@ -890,7 +973,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // generic history-replay branch already renders unknown roles via
     // appendText("system", …); this variant gives it the operator styling.
     // The `operator-context` marker is shared by every operator row (this
-    // bubble + the watch-result / guard-finding / idle-children cards) so the
+    // bubble + the watch-result / guard-finding / idle-children / idle-tasks cards) so the
     // retry-skip walk in _refreshRetryButton can skip them all uniformly.
     system: "system-context operator-context",
   };
@@ -970,49 +1053,251 @@ function createCoordinatorPane(root, wsId, opts) {
     return el;
   }
 
-  // Structured ``.msg.idle-children`` card for the coordinator-only
-  // ``idle_children`` operator-context system turn — lists the child
-  // workstreams still running while the coordinator went idle.  ``meta.children``
-  // is ``[{ws_id, name, state}]`` (names already ``sanitize_name``-cleaned at the
-  // producer); rendered via textContent so a hostile workstream name is inert.
-  function appendIdleChildren(meta) {
+  // Task statuses the pane knows how to render, mapped to the operator-facing
+  // chip text.  Mirrors ``_TASK_STATUS_IS_OPEN`` in coordinator_client.py —
+  // a cross-surface test pins the two key sets together, so a new status
+  // fails CI until this map knows it.  Doubles as the allowlist for the
+  // CSS class: the status string arrives from storage, and a hand-edited
+  // row (`status: "x y"`) would otherwise inject arbitrary classes via
+  // `className`.
+  const TASK_STATUS_LABELS = {
+    pending: "pending",
+    in_progress: "in progress",
+    done: "done",
+    blocked: "blocked",
+    needs_user: "needs you",
+  };
+
+  function taskStatusKnown(status) {
+    return Object.prototype.hasOwnProperty.call(TASK_STATUS_LABELS, status);
+  }
+
+  // Operator-facing text for a task status.  Both surfaces that show a
+  // status — the tasks sidebar chip and the idle-tasks conversation card
+  // — go through here, so one task can never read `in_progress` in one
+  // place and `in progress` in the other.  Unknown values pass through
+  // verbatim rather than being hidden.
+  function taskStatusLabel(status) {
+    return taskStatusKnown(status) ? TASK_STATUS_LABELS[status] : status;
+  }
+
+  // Shared DOM builder for the two idle cards.  The cards are the same
+  // class of notice ("you went idle with N outstanding") and share their
+  // grouped CSS rules; sharing the builder keeps the DOM shape in
+  // lockstep the same way — an accessibility attribute or scroll change
+  // lands on both or neither.  ``rows`` is
+  // ``[{name?, state?, note?, ident?}]``,
+  // all fields pre-sanitized at the producer and rendered via
+  // textContent so hostile values are inert.  Every field cell is
+  // conditional — a fresh idle-children row carries no name at all
+  // (card honesty: the model was told ids and states only), so an
+  // empty-name row must not leave a stray empty span between ident and
+  // state.  Both card kinds carry ``ident`` (the task id / the child's
+  // ws_id prefix), rendered as a leading column so a row with no name
+  // is still identifiable.  ``moreCount`` > 0 appends the overflow
+  // line so a capped list never reads as "that's all".
+  // The wrappers below keep their full className/data-ts-role literals
+  // — the test_coordinator_page pins grep for them.
+  function buildIdleCard(
+    className,
+    tsRole,
+    ariaLabel,
+    headerText,
+    rows,
+    moreCount,
+  ) {
     const el = document.createElement("div");
-    el.className = "msg idle-children operator-context";
+    el.className = className;
     el.setAttribute("role", "article");
-    el.setAttribute("data-ts-role", "idle_children");
-    el.setAttribute("aria-label", "idle children");
-    const children = Array.isArray(meta.children) ? meta.children : [];
+    el.setAttribute("data-ts-role", tsRole);
+    el.setAttribute("aria-label", ariaLabel);
     const header = document.createElement("div");
     header.className = "msg-idle-header";
-    header.textContent =
+    header.textContent = headerText;
+    el.appendChild(header);
+    const list = document.createElement("ul");
+    list.className = "msg-idle-list";
+    for (let i = 0; i < rows.length; i++) {
+      const r = rows[i] || {};
+      const li = document.createElement("li");
+      li.className = "msg-idle-child";
+      if (r.ident) {
+        // Identifier column, carried by both cards for one reason: a name
+        // is not an identity. A task's title may legitimately be empty or
+        // unidentifiable (a bracket-only title survives the producer's
+        // display projection intact), and a fresh idle-children row
+        // carries no name at all, so without this column such rows would
+        // leave the operator nothing to match against.
+        const ident = document.createElement("span");
+        ident.className = "msg-idle-child-ident";
+        ident.textContent = String(r.ident);
+        li.appendChild(ident);
+      }
+      if (r.name) {
+        const name = document.createElement("span");
+        name.className = "msg-idle-child-name";
+        name.textContent = String(r.name);
+        li.appendChild(name);
+      }
+      if (r.state) {
+        const state = document.createElement("span");
+        state.className = "msg-idle-child-state";
+        state.textContent = String(r.state);
+        li.appendChild(state);
+      }
+      if (r.note) {
+        const note = document.createElement("div");
+        note.className = "msg-idle-note";
+        note.textContent = String(r.note);
+        li.appendChild(note);
+      }
+      list.appendChild(li);
+    }
+    el.appendChild(list);
+    if (moreCount > 0) {
+      const more = document.createElement("div");
+      more.className = "msg-idle-more";
+      more.textContent = "…and " + moreCount + " more";
+      el.appendChild(more);
+    }
+    messagesEl.appendChild(el);
+    _scheduleScroll();
+    return el;
+  }
+
+  // Structured ``.msg.idle-children`` card for the coordinator-only
+  // ``idle_children`` operator-context system turn — lists the child
+  // workstreams still running while the coordinator went idle.
+  //
+  // CARD HONESTY: this card is the transcript's record of the nudge — it
+  // renders what the model was TOLD, formatted for operator readability,
+  // never content the model did not receive.  Fresh ``meta.children`` is
+  // ``[{ws_id, state}]`` — the body delivered to the model is ids and
+  // states only (child names are model-authored and are no longer lowered
+  // into the system turn), so the card renders ident + state and NO name
+  // column for those rows.  Child names live on the children sidebar, the
+  // browsing surface.
+  //
+  // OLD persisted rows (pre-roster-change transcripts replayed from
+  // /history) still carry a ``name`` key, and rendering it is legitimate
+  // by the same rule: those nudges DID deliver the name to the model at
+  // the time, so showing it records what the model received.  The map
+  // below therefore renders ``name`` exactly when the row carries one and
+  // never invents one — no ``|| c.ws_id`` fallback, which would render a
+  // "name" cell fresh rows must not have.  Workstream states render RAW,
+  // unlike the tasks card's status labels: running/thinking/attention are
+  // already plain lowercase words, while task statuses carry machine
+  // underscores (``in_progress``) that need the label map.  One
+  // vocabulary per surface-kind, not one rule for both cards.
+  function appendIdleChildren(meta) {
+    const children = Array.isArray(meta.children) ? meta.children : [];
+    // The ws_id's first 8 chars ride as `ident` — display formatting
+    // over the same full id the model-facing body's bullet carries
+    // whole (the bullet is a handle for the resolver, which refuses
+    // prefixes; this column is a label for the operator's eye) — and
+    // `ident` is the row's identity column; a fresh row renders
+    // ident + state and nothing else.
+    const rows = children.map((c) => ({
+      ident: c && c.ws_id ? String(c.ws_id).slice(0, 8) : "",
+      name: c && c.name ? String(c.name) : "",
+      state: c && c.state ? String(c.state) : "",
+    }));
+    const headerText =
       "idle · " +
       children.length +
       (children.length === 1
         ? " child still running"
         : " children still running");
-    el.appendChild(header);
-    const list = document.createElement("ul");
-    list.className = "msg-idle-list";
-    for (let i = 0; i < children.length; i++) {
-      const c = children[i] || {};
-      const li = document.createElement("li");
-      li.className = "msg-idle-child";
-      const name = document.createElement("span");
-      name.className = "msg-idle-child-name";
-      name.textContent = String(c.name || c.ws_id || "child");
-      li.appendChild(name);
-      if (c.state) {
-        const state = document.createElement("span");
-        state.className = "msg-idle-child-state";
-        state.textContent = String(c.state);
-        li.appendChild(state);
-      }
-      list.appendChild(li);
+    return buildIdleCard(
+      "msg idle-children operator-context",
+      "idle_children",
+      "idle children",
+      headerText,
+      rows,
+      0,
+    );
+  }
+
+  // Structured ``.msg.idle-tasks`` card for the coordinator-only
+  // ``idle_tasks`` operator-context system turn.  It fires independently
+  // of the children state, so it may arrive alone or co-deliver in the
+  // same drain beside the ``idle-children`` card, tasks first.
+  //
+  // CARD HONESTY: this card is the transcript's record of the nudge — it
+  // renders what the model was TOLD, formatted for operator readability,
+  // never content the model did not receive.  Fresh ``meta.counts`` is
+  // ``{open, in_progress, pending, ...}`` — the delivered body is one
+  // counts line plus the typed branches, with NO task text at all — so
+  // the card renders those counts and nothing else: one row per open
+  // status, in the sorted order the body's own split uses.  Statuses map
+  // through ``taskStatusLabel`` (formatting freedom; the label never adds
+  // content beyond the body's split), and zero counts render because the
+  // model was told the zero too.  A card that showed titles here would
+  // falsify the operator's mental model of what the coordinator knows;
+  // the tasks pane remains the browsing surface for rows.
+  //
+  // OLD persisted rows (pre-counts transcripts replayed from /history)
+  // still carry the row-shaped ``meta.tasks`` + ``meta.total``, and
+  // rendering those rows is legitimate by the same rule as the children
+  // card's ``name`` column: those nudges DID deliver the roster to the
+  // model at the time, so showing it records what the model received.
+  // That legacy path keeps the display-projection contract it shipped
+  // with — angle brackets survive (``sanitize_display`` at the then-
+  // producer), inert only because every field is written via
+  // ``textContent``; do not switch any of them to ``innerHTML``.
+  function appendIdleTasks(meta) {
+    const counts =
+      meta && meta.counts && typeof meta.counts === "object"
+        ? meta.counts
+        : null;
+    if (counts) {
+      const total = typeof counts.open === "number" ? counts.open : 0;
+      const rows = Object.keys(counts)
+        .filter((k) => k !== "open")
+        .sort()
+        .map((k) => ({
+          // Count in the name column, status label in the state chip:
+          // "1 · in progress".  Number coercion keeps a ragged
+          // non-numeric value visible rather than NaN-blank.
+          name: String(counts[k]),
+          state: taskStatusLabel(String(k)),
+        }));
+      const headerText =
+        "idle · " + total + (total === 1 ? " open task" : " open tasks");
+      return buildIdleCard(
+        "msg idle-tasks operator-context",
+        "idle_tasks",
+        "open tasks",
+        headerText,
+        rows,
+        0,
+      );
     }
-    el.appendChild(list);
-    messagesEl.appendChild(el);
-    _scheduleScroll();
-    return el;
+    const tasks = Array.isArray(meta.tasks) ? meta.tasks : [];
+    const total = typeof meta.total === "number" ? meta.total : tasks.length;
+    // Legacy rows: the producer emitted the DISPLAY projection of the
+    // title, which may be empty; this card's "(untitled)" fallback is
+    // keyed on THAT, and diverged from the then-body's strict-projection
+    // fallback by design. The id rides alongside as `ident` so an
+    // untitled row is still identifiable. Do NOT reintroduce a `|| t.id`
+    // fallback on `name`: `ident` is the id column, and folding the id
+    // into the name is what made the two surfaces disagree.
+    const rows = tasks.map((t) => ({
+      ident: t && t.id ? String(t.id) : "",
+      name: (t && t.title) || "(untitled)",
+      state: t && t.status ? taskStatusLabel(String(t.status)) : "",
+      note: t && t.note ? String(t.note) : "",
+    }));
+    const headerText =
+      "idle · " + total + (total === 1 ? " open task" : " open tasks");
+    return buildIdleCard(
+      "msg idle-tasks operator-context",
+      "idle_tasks",
+      "open tasks",
+      headerText,
+      rows,
+      Math.max(0, total - tasks.length),
+    );
   }
 
   // "queued message" bubble for a ``user_interjection`` system turn — shows the
@@ -1033,9 +1318,9 @@ function createCoordinatorPane(root, wsId, opts) {
   // Dispatch a first-class operator-context system turn to the right renderer.
   // Shared by the live ``system_turn`` SSE handler and history replay so the
   // two can't drift on which kinds get structured cards.  ``watch_triggered`` /
-  // ``output_guard`` / ``idle_children`` carry structured ``meta`` → cards;
-  // ``user_interjection`` → a "queued message" bubble; everything else → the
-  // labeled operator bubble.
+  // ``output_guard`` / ``idle_children`` / ``idle_tasks`` carry structured
+  // ``meta`` → cards; ``user_interjection`` → a "queued message" bubble;
+  // everything else → the labeled operator bubble.
   function renderSystemTurn(source, content, meta) {
     const m = meta && typeof meta === "object" ? meta : null;
     // /history projection of a persisted compaction marker — same result
@@ -1050,6 +1335,7 @@ function createCoordinatorPane(root, wsId, opts) {
       return appendWatchResult(m, content || "");
     if (source === "output_guard" && m) return appendGuardFinding(m);
     if (source === "idle_children" && m) return appendIdleChildren(m);
+    if (source === "idle_tasks" && m) return appendIdleTasks(m);
     if (source === "user_interjection")
       return appendInterjection(m, content || "");
     return appendText("system", content || "", {
@@ -1174,8 +1460,10 @@ function createCoordinatorPane(root, wsId, opts) {
       if (preview.length > 600) preview = preview.slice(0, 600) + "…";
     } else if (argsRaw) {
       // Malformed JSON or non-object args — show the raw payload
-      // truncated.  Matches the interactive replay's substring(0, 100)
-      // fallback at ui/static/app.js Pane.replayHistory.
+      // truncated.  Matches the interactive replay's fallback in
+      // shared_static/interactive.js replayHistory (the live parity
+      // source; the old ui/static/app.js Pane.replayHistory moved
+      // there in the L-shell step-5a lift).
       header = name;
       preview = argsRaw.length > 200 ? argsRaw.slice(0, 200) + "…" : argsRaw;
     }
@@ -2436,12 +2724,14 @@ function createCoordinatorPane(root, wsId, opts) {
     });
   }
 
-  function getJSON(url) {
+  function getJSON(url, init) {
     const fn = typeof authFetch === "function" ? authFetch : fetch;
-    return fn(url, { credentials: "include" }).then((r) => {
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      return r.json();
-    });
+    return fn(url, Object.assign({ credentials: "include" }, init || {})).then(
+      (r) => {
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        return r.json();
+      },
+    );
   }
 
   // ------------------------------------------------------------------
@@ -2505,6 +2795,24 @@ function createCoordinatorPane(root, wsId, opts) {
       clearTimeout(truncatedResyncTimer);
       truncatedResyncTimer = null;
     }
+    // liveToolCalls is deliberately NOT drained here (r7 ruling): the
+    // reconnect replay does NOT re-announce a live batch — replay_ok
+    // yields only events past lastEventId (the announce sits below it)
+    // and the coord fresh/truncated replay yields connected/status/
+    // pending-cards/verdicts, never tool_pending or tool_info — so a
+    // drain here left the render gate's tool-phase term EMPTY across
+    // every mid-batch redial and a slow seedless refetch resolving
+    // after the reopen wiped the live batch (fails OPEN).  A stale id
+    // instead fails CLOSED — a skipped render leaves the staleness
+    // latch set and heals at the next organic settle — and retirement
+    // is fully covered without this site: results still arrive through
+    // replay_ok (tool_result deletes), every fresh/truncated reconnect
+    // carries a synthetic state_change whose settle edge clears, and
+    // destroy() ends the closure.
+    // staleRetryTimer is deliberately NOT cancelled here — it is a
+    // REST-refetch heal, not transport state, and a transport-only redial
+    // must keep the pending heal intent (terminal-only cancel; see its
+    // decl and destroy()).
   }
 
   function connectSSE() {
@@ -3224,6 +3532,7 @@ function createCoordinatorPane(root, wsId, opts) {
         noteStreamOverflow();
         break;
       case "tool_result":
+        liveToolCalls.delete(ev.call_id || "");
         appendToolResult(
           ev.name || "tool",
           ev.call_id || "",
@@ -3377,7 +3686,7 @@ function createCoordinatorPane(root, wsId, opts) {
         // user interjection, metacognitive nudge, watch result — see
         // make_system_turn).  Rendered in trajectory sequence (it FOLLOWS the
         // turn it advises).  ``renderSystemTurn`` routes by ``ev.source`` to the
-        // structured card (watch / guard / idle-children) or the operator bubble
+        // structured card (watch / guard / idle-children / idle-tasks) or the operator bubble
         // (carrying ``ev.meta`` so cards rebuild identically live and on replay).
         // Dedup: skip a turn already painted from /history (matched by id) and
         // redelivered by an SSE replay past the resume cursor.  With the
@@ -3466,10 +3775,74 @@ function createCoordinatorPane(root, wsId, opts) {
           // server-side coalescing (#884).  If that herd ever measures
           // hot, sweep BOTH clients' idle-edge consumers together — do not
           // patch just this one.
+          // Settle edge: the turn is over, so any id still in the live
+          // set is a dead call whose result will never arrive — drain it
+          // or the residue would hold the render gate's tool-phase term
+          // closed forever (see liveToolCalls' decl).
+          liveToolCalls.clear();
           if (pendingTruncatedResync) {
             pendingTruncatedResync = false;
             recordTruncatedGap();
             loadHistoryThenReconnect();
+          } else if (
+            historyStale &&
+            !refetchesInFlight &&
+            !currentAssistantEl &&
+            !currentReasoningEl
+          ) {
+            // Staleness-latch backstop (#894): the clear_ui refetch and its
+            // one bounded retry both failed, so the transcript still doesn't
+            // match the server and rewind/edit stay latch-closed.  The turn
+            // just settled — refetch now.
+            //
+            // TRANSPORT-FREE BY DESIGN (ruled, do not "upgrade" this to
+            // loadHistoryThenReconnect): the heal must never touch the
+            // stream.  A reload's fresh reconnect draws the server's
+            // synthetic state_change:idle, which lands back in THIS branch —
+            // with /history down that is a zero-backoff disconnect/refetch/
+            // reconnect storm against a recovering node (interactive.js's
+            // round-5 critical), self-sustaining until /history recovers.
+            // A plain REST refetch emits zero SSE events, so this heal
+            // never CAUSES its own trigger and the self-loop is
+            // structurally impossible.  Precision on the trigger edges
+            // (r5): turn settles are the main one, but fresh/truncated
+            // SSE replays also carry a synthetic state_change (replay_ok
+            // does not) — so a latched pane pays one refetch per
+            // reconnect too.  That edge is bounded by the reconnect
+            // machinery's own jitter/backoff, is user/transport-driven
+            // rather than heal-driven, and the restart-herd /history load
+            // is bounded server-side by #884's single-flight — ruled
+            // acceptable; do NOT bolt a client-side limiter onto this arm
+            // (and never a transport-touching one).  Stream death has its
+            // own owners (EventSource native auto-reconnect, the
+            // truncated resync in the branch above — whose heal
+            // legitimately IS a reconnect: its stream is dead, this arm's
+            // is alive) and the else-if keeps the truncated branch's
+            // reload from doubling up (its render clears this latch too).
+            //
+            // The ref guards are a DELIBERATE divergence from the
+            // interactive template (which omits them on its backstop):
+            // interactive's replayHistory resets the streaming refs on
+            // every render, coord's refetchHistory does not — and this arm
+            // also serves state_change:error edges, where no stream_end
+            // ran finishAssistantStream and a live-bubble ref can
+            // survive.  Post-r5 the render-time gate in refetchHistory
+            // carries the wipe-safety correctness; these fire-time guards
+            // are the efficiency layer — they skip a fetch whose payload
+            // the gate would discard (a latched pane draining a K-deep
+            // send queue still pays one discarded fetch per settle edge
+            // it loses the race on; ruled acceptable — per-pane cost
+            // rides organic edges only and #884 coalesces the herd).
+            // Accepted liveness lag (ruled): if /history recovers while
+            // the pane sits idle untouched, rewind/edit stay closed until
+            // the next organic settle — strictly safer than the storm.
+            // Do not add ANY transport-touching timer to shorten it.
+            //
+            // Fire-and-forget, seedless: the stream is alive so lastEventId
+            // must not rewind; no composer state rides this heal (that is
+            // the clear_ui caller's .catch), so a render throw stays loud;
+            // and nothing here re-arms the retry, keeping it bounded.
+            refetchHistory();
           }
         } else if (
           ev.state === "running" ||
@@ -3556,6 +3929,14 @@ function createCoordinatorPane(root, wsId, opts) {
         // resync still armed when this rebuild lands); the residual
         // fetch-overlap window is transient-cosmetic and heals on the next
         // full render or chokepoint retry.
+        //
+        // Latch transcript staleness FIRST (#894): from this moment until a
+        // successful render the visible DOM is the PRE-rewind transcript
+        // and must not feed a rewind/edit turn count (see historyStale's
+        // decl).  The cosmetic [data-busy] grey-out for this window stays a
+        // deferred parity item (#890 PR ruling) — the handler-side
+        // ``busy || historyStale`` gate carries the correctness.
+        historyStale = true;
         refetchHistory()
           .then(() => {
             // Repair-intent supersession (pending resync timer + deferred
@@ -3564,6 +3945,74 @@ function createCoordinatorPane(root, wsId, opts) {
             // fetch (which also resolves) clears none, and a mid-render
             // throw skips this .then entirely — so the pending resync
             // stays the repair owner exactly when the pane still needs it.
+            //
+            // Failed fetch (the latch survived — only the success render
+            // clears it): arm the ONE bounded turn-free retry (#894).
+            // Armed here rather than in a failure branch so the retry's own
+            // failure cannot re-arm (bounded by construction); a NEWER
+            // clear_ui replaces the pending timer via the clearTimeout
+            // below, so at most one retry is ever pending.  Fire-time
+            // guards make a stale firing a no-op: healed or superseded
+            // (historyStale — coord has no load token; single-wsId, so the
+            // latch itself is the still-current signal), a fetch already
+            // in flight (!refetchesInFlight — yield instead of stomping it
+            // with a same-snapshot double render), mid-turn (!busy — the
+            // idle-edge backstop owns the busy case, e.g. the edit-resend
+            // dispatched below), a live bubble (the ref guards skip a
+            // fetch whose payload refetchHistory's render-time gate would
+            // discard — the gate carries the wipe-safety correctness,
+            // these are the efficiency layer), or torn down (visHandler —
+            // destroy() also cancels this timer outright, but
+            // coordCloseSession only nulls visHandler).
+            //
+            // The ARM is visHandler-gated too: this .then can settle AFTER
+            // a teardown (destroy/close-session during the in-flight
+            // refetch), and destroy's clearTimeout already ran — an arm
+            // here would recreate the orphan timer destroy exists to kill
+            // (a no-op fire, but it pins the dead closure for 2s).  The
+            // edit-resend below stays UNgated on teardown by design: the
+            // rewind committed server-side and the workstream outlives the
+            // pane UI, so the user's committed edit still delivers.
+            if (historyStale && visHandler) {
+              if (staleRetryTimer) clearTimeout(staleRetryTimer);
+              staleRetryTimer = setTimeout(
+                () => {
+                  staleRetryTimer = null;
+                  if (
+                    historyStale &&
+                    !refetchesInFlight &&
+                    !busy &&
+                    !currentAssistantEl &&
+                    !currentReasoningEl &&
+                    visHandler &&
+                    evtSource &&
+                    evtSource.readyState === EventSource.OPEN
+                  ) {
+                    // Stream must be OPEN, not merely present: close-on-hide
+                    // keeps this timer armed by design (the fire can land
+                    // with the transport down), and a CONNECTING source has
+                    // a frozen cursor with a pending replay — a seedless
+                    // fetch then would render past it (double-render when
+                    // the replay lands).  Skip instead; the latch survives
+                    // and the next organic settle re-fires the backstop.
+                    // The backstop itself needs no such term: it runs
+                    // inside SSE dispatch, so its stream is live by
+                    // construction.  refetchHistory's render-time gate
+                    // re-checks every invariant across the await window.
+                    // Fire-and-forget, seedless (live stream — lastEventId
+                    // must not rewind); a render throw stays loud, as on the
+                    // backstop.
+                    refetchHistory();
+                  }
+                  // ADDITIVE spread over the 2000 floor: one clear_ui reaches
+                  // every listener on the ws, so an un-spread retry re-fetches
+                  // in lockstep across tabs.  The floor is load-bearing (the
+                  // e2e non-occurrence windows size on it) — jitter up, never
+                  // down.  Mirrored in interactive.js; the constant is shared.
+                },
+                STALE_RETRY_BASE_MS + Math.random() * STALE_RETRY_JITTER_MS,
+              );
+            }
             if (!_pendingEditSend) return;
             const editText = _pendingEditSend;
             _pendingEditSend = null;
@@ -3670,6 +4119,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // Reuses the --running placeholder (subtle accent rail, no actions)
         // the replay path already knows how to upgrade; the ``announce`` flag
         // only swaps the kicker to "Evaluating" while the judge runs.
+        (ev.items || []).forEach((it) => {
+          if (it.call_id) liveToolCalls.add(it.call_id);
+        });
         appendToolBatch(ev.items || [], {
           announce: true,
           running: true,
@@ -3691,6 +4143,9 @@ function createCoordinatorPane(root, wsId, opts) {
         // — the tool starts executing the moment auto-approval lands,
         // and the batch should show the same RUNNING indicator the
         // replay path renders for an unresolved committed turn.
+        (ev.items || []).forEach((it) => {
+          if (it.call_id) liveToolCalls.add(it.call_id);
+        });
         appendToolBatch(ev.items || [], { auto: true, running: true });
         break;
       // Child-workstream fan-out routed through the coordinator's own
@@ -4656,9 +5111,14 @@ function createCoordinatorPane(root, wsId, opts) {
     row.className = "task-row";
     row.setAttribute("role", "listitem");
     const status = task.status || "pending";
+    // Unknown values keep the neutral base chip rather than styling
+    // themselves — the allowlist is what stops a hand-edited status
+    // from injecting classes through `className`.
     const statusSpan = document.createElement("span");
-    statusSpan.className = "status status-" + status;
-    statusSpan.textContent = status;
+    statusSpan.className = taskStatusKnown(status)
+      ? "status status-" + status
+      : "status";
+    statusSpan.textContent = taskStatusLabel(status);
     const title = document.createElement("span");
     title.className = "title";
     title.textContent = task.title || "";
@@ -4666,6 +5126,12 @@ function createCoordinatorPane(root, wsId, opts) {
     head.appendChild(statusSpan);
     head.appendChild(title);
     row.appendChild(head);
+    if (task.note) {
+      const noteEl = document.createElement("div");
+      noteEl.className = "meta note";
+      noteEl.textContent = task.note;
+      row.appendChild(noteEl);
+    }
     if (task.child_ws_id && WS_ID_RE.test(task.child_ws_id)) {
       const link = document.createElement("div");
       link.className = "meta";
@@ -5278,6 +5744,10 @@ function createCoordinatorPane(root, wsId, opts) {
   // ------------------------------------------------------------------
 
   function _rewindToTurns(turns) {
+    // Deliberately busy-only, NOT latch-gated (#894 ruling): the caller
+    // passes an explicit turn count, so transcript staleness cannot
+    // corrupt it, and programmatic rewinds must keep working while a heal
+    // is pending.  The DOM-counting wrappers below carry the latch.
     if (busy) return;
     if (!Number.isInteger(turns) || turns < 1) return;
     authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/rewind", {
@@ -5291,7 +5761,14 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _rewindToMessage(msgEl) {
-    if (busy) return;
+    // busy || historyStale (#894, the #890 port): from clear_ui arrival
+    // until the next SUCCESSFUL refetchHistory render — the fetch window
+    // AND the failed-fetch aftermath — the visible transcript is the
+    // stale PRE-rewind DOM with busy false, so the .msg.user count below
+    // would over-rewind the already-restructured server conversation.
+    // The latch closes exactly that window; see historyStale's decl for
+    // the heal paths that reopen the affordances.
+    if (busy || historyStale) return;
     const userMsgs = messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
@@ -5300,6 +5777,10 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _retryLast() {
+    // Deliberately busy-only, NOT latch-gated (#894 ruling): no DOM count
+    // feeds this POST — /retry re-runs the server's own last turn, which
+    // is authoritative regardless of what the pane shows.  Mirrors
+    // interactive.js, whose retry is equally ungated.
     if (busy) return;
     authFetch("/v1/api/workstreams/" + encodeURIComponent(wsId) + "/retry", {
       method: "POST",
@@ -5310,7 +5791,10 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _editAndResend(msgEl, newText) {
-    if (busy) return;
+    // busy || historyStale (#894): same stale-DOM hazard as
+    // _rewindToMessage — the turn count AND the _pendingEditSend latch
+    // would both bind to a transcript the server no longer has.
+    if (busy || historyStale) return;
     const userMsgs = messagesEl.querySelectorAll(".msg.user");
     const idx = Array.prototype.indexOf.call(userMsgs, msgEl);
     if (idx < 0) return;
@@ -5362,7 +5846,11 @@ function createCoordinatorPane(root, wsId, opts) {
   }
 
   function _startEdit(msgEl, originalText) {
-    if (busy) return;
+    // busy || historyStale (#894): entering edit mode on a stale row would
+    // let the user type into a message the pending re-render is about to
+    // replaceChildren away — and _editAndResend would refuse the submit
+    // anyway.  Gate at entry so the affordance and the action agree.
+    if (busy || historyStale) return;
     // Save current child nodes so Cancel can restore them.
     const savedNodes = [];
     while (msgEl.firstChild) {
@@ -5488,7 +5976,7 @@ function createCoordinatorPane(root, wsId, opts) {
     // Skip retry when the most recent semantic turn is tool-only (last DOM
     // child is a .conv-batch construct); walk back past operator-context
     // rows first — the plain system bubble AND the structured watch-result /
-    // guard-finding / idle-children cards all carry .operator-context — so the
+    // guard-finding / idle-children / idle-tasks cards all carry .operator-context — so the
     // guard still fires when the tool turn carried a nudge / guard finding.
     // Keying on the shared marker (not any single card class) keeps the skip
     // correct as new card kinds are added. (Both personas now render the
@@ -5568,13 +6056,40 @@ function createCoordinatorPane(root, wsId, opts) {
   // empty — harmless no-ops.
   async function refetchHistory(seedCursor = false) {
     let hist = null;
+    // Count the await window so the staleness heals can yield to an
+    // in-flight fetch (see refetchesInFlight's decl).  Only the fetch
+    // needs bracketing: the render below runs synchronously after the
+    // await, so no timer or SSE handler can observe the counter
+    // mid-render.  The seq stamp makes overlapping dispatches resolve
+    // last-dispatch-wins at the render-time gate.
+    const seq = ++refetchSeq;
+    refetchesInFlight++;
+    // Bound the await (r7): the counter and both heals gate on this
+    // fetch settling.  A /history that is accepted and never answered
+    // (wedged node, stalled response body) would otherwise pin
+    // refetchesInFlight above zero for the life of the page and every
+    // heal would yield forever — beyond the ruled settle-lag.  Same
+    // AbortController + flat-timeout shape as coordSend's /send bound;
+    // an abort lands in the catch, the latch survives, and the heals
+    // retry on later organic edges against a fresh attempt.
+    const histCtrl =
+      typeof AbortController === "function" ? new AbortController() : null;
+    if (histCtrl) histCtrls.add(histCtrl);
+    const histTimer = histCtrl
+      ? setTimeout(() => histCtrl.abort(), 15000)
+      : null;
     try {
       hist = await getJSON(
         "/v1/api/workstreams/" + encodeURIComponent(wsId) + "/history",
+        histCtrl ? { signal: histCtrl.signal } : undefined,
       );
     } catch (e) {
       console.warn("coord history fetch failed", e);
       hist = null;
+    } finally {
+      if (histTimer) clearTimeout(histTimer);
+      if (histCtrl) histCtrls.delete(histCtrl);
+      refetchesInFlight--;
     }
     // A FAILED fetch keeps the pane intact: the wipe + tracking resets
     // run only once a payload actually arrived.  (Pre-#882 the wipe ran
@@ -5588,6 +6103,83 @@ function createCoordinatorPane(root, wsId, opts) {
     // refetch.)  Success ordering is unchanged: the wipe always ran
     // after the await, never as immediate feedback.
     if (!hist) return;
+    // RENDER-TIME gate (#894 r4, re-derived r5): the await above is a
+    // real window — pane state can change between a caller's fire-time
+    // checks and this render, and only THIS site can see across it
+    // (chokepoint, not per-caller guards).  The gate reads DOM-LIVE-STATE
+    // signals, never plain ``busy`` — that distinction is the r5 lesson:
+    // ``busy`` means "a turn is executing", not "this DOM holds live turn
+    // state", and the two diverge exactly where it hurt.  _editAndResend
+    // flips busy BEFORE its POST and /rewind emits only clear_ui (no
+    // state_change), so a busy term skipped the truncation render the
+    // rewind exists to produce and appended the resent bubble onto the
+    // PRE-rewind transcript; /retry's regenerated turn likewise raced its
+    // own clear_ui refetch.  A skipped render must only ever mean "the
+    // wipe would destroy live DOM" or "the paint would outrun the
+    // cursor":
+    //
+    // - seq (universal): a newer dispatch supersedes this payload
+    //   (last-DISPATCH-wins; see refetchSeq's decl).
+    // - content refs (universal): a live bubble ref means the stream is
+    //   mid-CONTENT — wiping detaches the node every remaining token
+    //   renders into.  Universal because skipping always beats
+    //   stranding a ref, and the seeded callers null their refs before
+    //   fetching anyway (loadHistoryThenReconnect explicitly; init
+    //   pre-connect), so this never blocks them.
+    // - SEEDLESS-only, because the seeded flows deliberately render
+    //   over/instead-of these states (keying on the seedCursor ARG, not
+    //   caller identity):
+    //   . liveToolCalls.size — a tool batch whose results are still
+    //     arriving on the live stream; wiping would orphan the rows the
+    //     stream keeps writing into.  EVENT-DRIVEN by construction (see
+    //     the decl): the r5 shape probed the DOM for
+    //     .conv-batch--running, but this render's own replay path
+    //     paints orphan batches (committed tool_calls, no persisted
+    //     result) with that same class and nothing ever strips a dead
+    //     orphan's — one orphan paint would poison every seedless heal
+    //     for the life of the page (the r6 find, REACHABLE per r7: a
+    //     hard crash leaves the orphan persisted — only graceful close
+    //     synthesizes a cancel result — and G6 proves the rewind
+    //     renders through the residue).  NOT activeBatch either — that is
+    //     the pending-APPROVAL tracker (the r5 re-derivation's first
+    //     mistake).  Liveness comes from the stream, never from DOM a
+    //     render can forge.  The SEEDED resync bypasses the term: after
+    //     a node dies mid-batch the render IS the recovery — the replay
+    //     adopts hist.cursor and rebuilds any genuinely live turn
+    //     (blocking that render wedged coord-restart outright, the r5
+    //     family-run find).
+    //   . busySource === "optimistic" — coordSend's pre-POST flip, the
+    //     one busy flavor that marks un-committed DOM (an optimistic
+    //     row the snapshot may not carry; see setBusy's contract).  The
+    //     seeded resync renders through it: dead-stream recovery
+    //     outranks a transient row, matching pre-#894 behavior.  The
+    //     clear_ui .then's edit-resend paints under plain "server" busy
+    //     instead; its narrower wipe window (a second actor's clear_ui
+    //     inside the resend's commit gap) is accepted — the resent
+    //     message re-appears at its turn's settle heal, and pre-#894
+    //     behavior there was an over-rewind.
+    //   . stream-OPENness — CONNECTING is NOT live (native
+    //     auto-reconnect keeps the handle with a frozen lastEventId and
+    //     a pending replay; painting past the cursor double-renders
+    //     when that replay lands; hide/suspend null the handle
+    //     outright).  The seeded flows own their reconnect and adopt
+    //     hist.cursor below.
+    //
+    // On every skip the staleness latch survives (clear is below), the
+    // affordance gate stays closed, and the next organic settle re-fires
+    // the backstop.  The callers' fire-time guards remain as the
+    // efficiency layer (skip the pointless fetch); THIS gate is the
+    // correctness carrier.
+    if (seq !== refetchSeq) return;
+    if (currentAssistantEl || currentReasoningEl) return;
+    if (
+      !seedCursor &&
+      (busySource === "optimistic" ||
+        liveToolCalls.size > 0 ||
+        !evtSource ||
+        evtSource.readyState !== EventSource.OPEN)
+    )
+      return;
     messagesEl.replaceChildren();
     // A full committed-history render repairs any recorded truncation gap —
     // whether this render came from the truncated resync itself or from an
@@ -5609,6 +6201,27 @@ function createCoordinatorPane(root, wsId, opts) {
     if (truncatedResyncTimer) {
       clearTimeout(truncatedResyncTimer);
       truncatedResyncTimer = null;
+    }
+    // A successful full render also restores transcript truth: clear the
+    // staleness latch and cancel the pending heal retry (#894).  These sit
+    // HERE — below the ``if (!hist) return`` and beside the other repair
+    // clears, BEFORE the long render loop — so a FAILED fetch leaves the
+    // latch set (which is what arms the retry/backstop), while a mid-render
+    // throw doesn't re-close a pane whose replaceChildren already
+    // committed (a partially painted FRESH transcript at worst
+    // UNDER-counts, the safe direction).  The ONLY latch-clear site.
+    // Freshness layers (r9 accounting): a dispatch that PREDATES the
+    // latest clear_ui never reaches here at all — clear_ui always
+    // dispatches immediately after arriving, so a stale-epoch dispatch
+    // is also a stale-SEQ dispatch and the currency gate above discards
+    // it (an r8 epoch guard here was unreachable and was removed).  The
+    // remaining freshness hazard — a CURRENT dispatch joining a
+    // pre-rewind server flight — is closed server-side: the #884 flight
+    // key folds in the ws's truncation generation.
+    historyStale = false;
+    if (staleRetryTimer) {
+      clearTimeout(staleRetryTimer);
+      staleRetryTimer = null;
     }
     toolRows.clear();
     activeBatch = null;
@@ -5889,7 +6502,7 @@ function createCoordinatorPane(root, wsId, opts) {
         } else if (role === "system") {
           // First-class operator-context system turn — ``renderSystemTurn``
           // routes by ``m.source`` to the structured card (watch / guard /
-          // idle-children) or the operator bubble, reading ``m.meta`` from the
+          // idle-children / idle-tasks) or the operator bubble, reading ``m.meta`` from the
           // ``/history`` projection so replay matches the live render exactly.
           if (!content) return;
           renderSystemTurn(m.source || "", content, m.meta);
@@ -5928,6 +6541,27 @@ function createCoordinatorPane(root, wsId, opts) {
     // Stream + the retry timers (reconnect backoff, degraded catch-up,
     // truncated resync).
     closeStreamTransport();
+    // The clear_ui-failure retry deliberately survives closeStreamTransport
+    // (transport-only redials keep the heal intent — see its decl), so it
+    // must die HERE, the terminal path: destroy() bumps no generation, and
+    // while the visHandler fire-time guard would render a post-destroy
+    // firing inert, a timer into a destroyed pane must be dead, not merely
+    // inert — it pins the closure for its remaining delay.
+    if (staleRetryTimer) {
+      clearTimeout(staleRetryTimer);
+      staleRetryTimer = null;
+    }
+    // Abort every in-flight /history for the same reason: the 15s bound
+    // alone would keep the detached pane's closure alive until it fired
+    // (the settled fetches' renders then discard via the !hist path).
+    histCtrls.forEach((c) => {
+      try {
+        c.abort();
+      } catch (_) {
+        /* noop */
+      }
+    });
+    histCtrls.clear();
     [
       cancelTimeoutId,
       forceTimeoutId,
