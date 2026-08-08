@@ -22,3 +22,4 @@ class MatrixConfig(ChannelConfig):
     store_path: str = "/Users/c/.local/share/turnstone/matrix-store"
     allowed_rooms: list[str] = ""  # empty = all rooms
     max_message_length: int = 16384  # Matrix supports large messages
+    ca_cert_path: str = ""  # trust a self-signed homeserver cert; empty = default system trust

@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import os
 import signal
+import ssl
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -193,11 +194,24 @@ class TurnstoneMatrixBot:
 
         os.makedirs(self.config.store_path, exist_ok=True)
 
+        # Trust a self-signed homeserver cert (e.g. CWWK's Traefik-fronted
+        # tuwunel) by loading it into an SSLContext built on top of the
+        # normal system trust store — additive, not a replacement, so other
+        # TLS connections this process makes (Anthropic, OpenAI, etc.) are
+        # unaffected. `ssl=None` (nio's default) is a normal verified
+        # ssl.create_default_context() with no way to add a CA short of
+        # this.
+        ssl_context: ssl.SSLContext | None = None
+        if self.config.ca_cert_path:
+            ssl_context = ssl.create_default_context()
+            ssl_context.load_verify_locations(cafile=self.config.ca_cert_path)
+
         self._client = AsyncClient(
             self.config.homeserver,
             self.config.user_id,
             store_path=self.config.store_path,
             device_id=self.config.device_id,
+            ssl=ssl_context,
             # nio retries transport failures forever by default (max_timeouts
             # unset). Seen in prod: one aiohttp connection wedged for 33+
             # hours straight, 700+ retries, never recovering on its own.

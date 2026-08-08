@@ -122,6 +122,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("TURNSTONE_MATRIX_STORE_PATH", ""),
         help="Matrix nio store path (default: $TURNSTONE_MATRIX_STORE_PATH)",
     )
+    parser.add_argument(
+        "--matrix-ca-cert",
+        default=os.environ.get("TURNSTONE_MATRIX_CA_CERT", ""),
+        help="CA cert file to trust for the Matrix homeserver connection "
+        "(e.g. a self-signed cert); empty = default system trust "
+        "(default: $TURNSTONE_MATRIX_CA_CERT)",
+    )
 
     # -- HTTP server ---------------------------------------------------------
     parser.add_argument(
@@ -321,6 +328,7 @@ def _build_adapters(
             store_path=args.matrix_store_path or os.path.expanduser(
                 "~/.local/share/turnstone/matrix-store"
             ),
+            ca_cert_path=args.matrix_ca_cert,
         )
         matrix_bot = TurnstoneMatrixBot(
             matrix_config,
