@@ -5558,6 +5558,12 @@ class ChatSession:
                         model_alias, caps=resolved_caps
                     ),
                     resolve_attachments=lambda ids: self._resolve_attachments(ids, resolved_caps),
+                    # Threads this workstream's id to the model backend so an
+                    # opaque CLI-wrapping proxy (e.g. claude_proxy.py) can bridge
+                    # Turnstone's judge/approval gate into a subprocess-level
+                    # PreToolUse hook — see docs/turnstone-fork-patches.md
+                    # "External tool-call gating bridge" (2026-08-09).
+                    extra_headers={"X-Turnstone-Ws-Id": self.ws_id},
                 )
             except Exception as e:
                 ename = type(e).__name__

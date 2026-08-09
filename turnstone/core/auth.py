@@ -868,6 +868,25 @@ def load_jwt_secret() -> str:
     return secret
 
 
+def load_external_tool_check_secret() -> str:
+    """Load the shared secret for POST /v1/api/workstreams/{ws_id}/external-tool-check.
+
+    Local fork patch (2026-08-09) — see docs/turnstone-fork-patches.md
+    "External tool-call gating bridge". Unlike ``load_jwt_secret``, returns
+    "" instead of raising when unset: this endpoint only exists to support
+    a specific proxy-wrapped model backend (claude_proxy.py), and most
+    installs will never configure it. The route itself 503s when this is
+    empty, rather than the whole server refusing to start.
+    """
+    secret = os.environ.get("TURNSTONE_EXTERNAL_TOOL_CHECK_SECRET", "").strip()
+    if not secret:
+        from turnstone.core.config import load_config
+
+        server_cfg = load_config("server")
+        secret = str(server_cfg.get("external_tool_check_secret", "")).strip()
+    return secret
+
+
 def create_jwt(
     user_id: str,
     scopes: frozenset[str],
@@ -1012,6 +1031,17 @@ def is_public_path(path: str) -> bool:
     if normalized in PUBLIC_PATHS:
         return True
     if any(normalized.startswith(prefix) for prefix in PUBLIC_PREFIXES):
+        return True
+    # Local fork patch (2026-08-09) — see docs/turnstone-fork-patches.md
+    # "External tool-call gating bridge". /api/workstreams/{ws_id}/
+    # external-tool-check has its own auth (a shared secret checked inside
+    # the handler itself, via load_external_tool_check_secret) — the same
+    # shape as /api/auth/login above, which also has its own credential
+    # check rather than requiring a pre-existing JWT. Exempted here by
+    # suffix (not PUBLIC_PATHS, which is exact-match only and can't express
+    # the variable ws_id segment); the handler still 401s a wrong/missing
+    # secret and 503s when the feature isn't configured.
+    if normalized.endswith("/external-tool-check"):
         return True
     # Console proxy: a public proxied path is still public.  Without this
     # the login/status/setup endpoints are unreachable from inside a

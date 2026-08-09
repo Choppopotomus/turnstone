@@ -83,6 +83,7 @@ from turnstone.core.session_routes import (
     make_detail_handler,
     make_events_handler,
     make_export_handler,
+    make_external_tool_check_handler,
     make_history_handler,
     make_list_handler,
     make_open_handler,
@@ -4962,6 +4963,12 @@ def create_app(
         interactive_endpoint_config,
         accepted_permissions=("tools.approve", "admin.coordinator"),
     )
+    # Local fork patch (2026-08-09) — see docs/turnstone-fork-patches.md
+    # "External tool-call gating bridge". Not part of SharedSessionVerbHandlers
+    # (auth is a shared secret, not the normal permission-gate flow), so it's
+    # registered as a standalone Route below rather than through
+    # register_session_routes.
+    external_tool_check_handler = make_external_tool_check_handler(interactive_endpoint_config)
     close_handler = make_close_handler(
         interactive_endpoint_config,
         audit_emit=_audit_close_workstream,
@@ -5033,6 +5040,17 @@ def create_app(
         Route(
             "/api/workstreams/{ws_id}/speech-to-text",
             speech_to_text,
+            methods=["POST"],
+        )
+    )
+    # Local fork patch (2026-08-09) — docs/turnstone-fork-patches.md
+    # "External tool-call gating bridge". Standalone (not via
+    # register_session_routes) since its auth is a shared secret, not the
+    # normal permission-gate flow the other verbs share.
+    v1_routes.append(
+        Route(
+            "/api/workstreams/{ws_id}/external-tool-check",
+            external_tool_check_handler,
             methods=["POST"],
         )
     )

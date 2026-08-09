@@ -955,6 +955,107 @@ def make_approve_handler(
     return approve
 
 
+def make_external_tool_check_handler(cfg: SessionEndpointConfig) -> Handler:
+    """``POST {prefix}/{ws_id}/external-tool-check`` — local fork patch (2026-08-09).
+
+    See docs/turnstone-fork-patches.md "External tool-call gating bridge".
+    Bridges a tool call an OPAQUE model backend (e.g. claude_proxy.py's
+    ``claude -p`` subprocess) is about to make, but which never passed
+    through this workstream's normal ``ChatSession._execute_tools`` path,
+    into the SAME approval gate an in-process tool call would hit —
+    ``ws.ui.approve_tools`` runs the real policy/auto-approve/smart-
+    approvals/human-prompt gate and blocks up to ``_APPROVAL_WAIT_TIMEOUT``.
+    No new approval logic here; this is purely a new entry point into the
+    existing one.
+
+    Deliberately does NOT go through ``ChatSession._safe_prepare_tool`` —
+    that validates against Turnstone's OWN native tool registry
+    (``read_file``, ``bash``, etc.), a different vocabulary than the wrapped
+    CLI's tools (``Read``, ``Write``, ...). An unrecognized name there gets
+    tagged with an ``error`` and ``needs_approval=False``, which
+    ``approve_tools`` then silently auto-passes — confirmed live 2026-08-09,
+    the first version of this handler used ``_safe_prepare_tool`` and every
+    call auto-approved without ever reaching a human, exactly the bug this
+    bridge exists to close. The item dict is built directly instead, with
+    ``needs_approval`` hardcoded ``True`` — this bridge intentionally treats
+    every externally-gated call as needing a real decision rather than
+    replicating Turnstone's own native per-tool risk tiering, which was
+    designed for a different tool set.
+
+    Auth is a single shared secret (``load_external_tool_check_secret``),
+    not the normal user JWT/token flow — the only legitimate caller is a
+    trusted-local subprocess spawned by claude_proxy.py on 127.0.0.1, never
+    a browser or a remote client. 503s when the secret isn't configured
+    (feature opt-in, most installs never set it); 401 on a wrong/missing
+    secret; 404 for an unknown ws_id, matching every other verb in this
+    file.
+    """
+    import json
+    import uuid
+
+    from turnstone.core.auth import load_external_tool_check_secret
+    from turnstone.core.web_helpers import read_json_or_400
+
+    async def external_tool_check(request: Request) -> Response:
+        secret = load_external_tool_check_secret()
+        if not secret:
+            return JSONResponse(
+                {"error": "external-tool-check is not configured on this server"},
+                status_code=503,
+            )
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header != f"Bearer {secret}":
+            return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+        mgr_opt, err503 = cfg.manager_lookup(request)
+        if err503 is not None:
+            return err503
+        mgr = cast("SessionManager", mgr_opt)
+
+        ws_id = request.path_params.get("ws_id", "")
+        ws = mgr.get(ws_id)
+        if ws is None or ws.session is None or ws.ui is None:
+            return JSONResponse({"error": cfg.not_found_label}, status_code=404)
+
+        body = await read_json_or_400(request)
+        if isinstance(body, JSONResponse):
+            return body
+        tool_name = str(body.get("tool_name", "")).strip()
+        tool_input = body.get("tool_input")
+        if not tool_name or not isinstance(tool_input, dict):
+            return JSONResponse(
+                {"error": "tool_name (string) and tool_input (object) are required"},
+                status_code=400,
+            )
+        tool_use_id = str(body.get("tool_use_id", "") or f"ext_{uuid.uuid4().hex}")
+
+        # Built directly, NOT via ``_safe_prepare_tool`` — see docstring.
+        # ``needs_approval=True`` is load-bearing: ``approve_tools`` filters
+        # ``pending = [it for it in items if it.get("needs_approval") and not
+        # it.get("error")]`` — omit this and the item silently auto-passes
+        # without ever reaching policy checks, smart approvals, or a human.
+        preview = json.dumps(tool_input)[:500]
+        item = {
+            "call_id": tool_use_id,
+            "func_name": tool_name,
+            "approval_label": tool_name,
+            "header": f"⚙ {tool_name} (external, via claude_proxy.py bridge)",
+            "preview": f"    {preview}",
+            "needs_approval": True,
+        }
+        # approve_tools is a BLOCKING call (threading.Event.wait() inside,
+        # up to _APPROVAL_WAIT_TIMEOUT=3600s) — running it directly on the
+        # event loop freezes the ENTIRE server (every workstream, /health,
+        # everything) for the whole wait, confirmed live 2026-08-09 (a
+        # trivial /health check hung until this was fixed). asyncio.to_thread
+        # is the same pattern the approve handler above uses for its own
+        # blocking tenant_check call.
+        approved, reason = await asyncio.to_thread(ws.ui.approve_tools, [item])
+        return JSONResponse({"approved": approved, "reason": reason})
+
+    return external_tool_check
+
+
 CloseAuditEmitter = Callable[
     ["Request", str, "Workstream", str],
     None,
