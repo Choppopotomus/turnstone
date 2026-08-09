@@ -22,6 +22,16 @@ from turnstone.sdk.events import (
     StreamEndEvent,
 )
 
+# ---------------------------------------------------------------------------
+# Restart recovery (2026-08-09 follow-up): the four missed-turn-recovery
+# tracking dicts are plain in-memory state that starts empty on every bot
+# process boot, so a restart looked identical to a brand-new subscription
+# and silently lost any turn that completed during the restart window.
+# _recover_routes() now seeds that state from a persisted checkpoint
+# (channel_routes.last_turn_count/last_seen_text) before resubscribing, so
+# the existing reconnect-recovery machinery also covers a restart.
+# ---------------------------------------------------------------------------
+
 
 def _run(coro):  # type: ignore[no-untyped-def]
     return asyncio.run(coro)
@@ -477,4 +487,195 @@ class TestRecoveryStateCleanup:
             assert task.cancelled()
             assert "ws-1" not in bot._recovery_tasks
 
+
+class TestRestartRecoverySeeding:
+    """_recover_routes: seeding in-memory state from a persisted checkpoint."""
+
+    def test_seeds_state_from_persisted_checkpoint(self) -> None:
+        bot = _make_bot()
+        bot.storage.list_channel_routes_by_type = MagicMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "channel_type": "matrix",
+                    "channel_id": ROOM,
+                    "ws_id": "ws-1",
+                    "node_id": "",
+                    "created": "2026-01-01T00:00:00",
+                    "last_turn_count": 5,
+                    "last_seen_text": "the last thing sent before restart",
+                }
+            ]
+        )
+        bot.subscribe_ws = AsyncMock()  # type: ignore[method-assign]
+
+        _run(bot._recover_routes())
+
+        assert "ws-1" in bot._ever_connected
+        assert bot._last_turn_count["ws-1"] == 5
+        assert bot._last_seen_text["ws-1"] == "the last thing sent before restart"
+        bot.subscribe_ws.assert_awaited_once_with("ws-1", ROOM)
+
+    def test_route_without_checkpoint_is_not_seeded(self) -> None:
+        """A route created moments before a restart, never checkpointed
+        yet, must NOT be seeded -- that would be a false-positive
+        recovery trigger on its very first connect."""
+        bot = _make_bot()
+        bot.storage.list_channel_routes_by_type = MagicMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "channel_type": "matrix",
+                    "channel_id": ROOM,
+                    "ws_id": "ws-1",
+                    "node_id": "",
+                    "created": "2026-01-01T00:00:00",
+                    "last_turn_count": None,
+                    "last_seen_text": None,
+                }
+            ]
+        )
+        bot.subscribe_ws = AsyncMock()  # type: ignore[method-assign]
+
+        _run(bot._recover_routes())
+
+        assert "ws-1" not in bot._ever_connected
+        assert "ws-1" not in bot._last_turn_count
+        assert "ws-1" not in bot._last_seen_text
+
+    def test_seeded_state_triggers_recovery_on_first_post_restart_status(self) -> None:
+        """The seeding itself is the whole fix -- _handle_connected and
+        _handle_status need no changes to correctly treat the first
+        post-restart connect as a reconnect once seeded."""
+        bot = _make_bot()
+        bot.storage.list_channel_routes_by_type = MagicMock(  # type: ignore[method-assign]
+            return_value=[
+                {
+                    "channel_type": "matrix",
+                    "channel_id": ROOM,
+                    "ws_id": "ws-1",
+                    "node_id": "",
+                    "created": "2026-01-01T00:00:00",
+                    "last_turn_count": 5,
+                    "last_seen_text": None,
+                }
+            ]
+        )
+        bot.subscribe_ws = AsyncMock()  # type: ignore[method-assign]
+
+        async def scenario() -> None:
+            await bot._recover_routes()
+            bot._recover_missed_turn = AsyncMock()  # type: ignore[method-assign]
+            # First SSE connect after the (simulated) restart.
+            await bot._on_ws_event("ws-1", ROOM, ConnectedEvent(ws_id="ws-1"))
+            # Server's turn_count has moved past what was persisted --
+            # a turn completed during the restart window.
+            await bot._on_ws_event("ws-1", ROOM, StatusEvent(ws_id="ws-1", turn_count=7))
+            await asyncio.sleep(0)
+
         _run(scenario())
+
+        bot._recover_missed_turn.assert_called_once_with("ws-1", ROOM, 2)
+
+
+class TestStatusPersistCadence:
+    """_handle_status: the checkpoint write, gated on actual change."""
+
+    def test_persists_only_when_turn_count_changes(self) -> None:
+        """A tool-heavy turn emits one StatusEvent per LLM API round-trip,
+        all carrying the same turn_count -- must not write once per event."""
+        bot = _make_bot()
+        bot.storage.update_channel_route_recovery_state = MagicMock()  # type: ignore[attr-defined]
+
+        async def scenario() -> None:
+            await bot._on_ws_event("ws-1", ROOM, StatusEvent(ws_id="ws-1", turn_count=1))
+            await bot._on_ws_event("ws-1", ROOM, StatusEvent(ws_id="ws-1", turn_count=1))
+            await bot._on_ws_event("ws-1", ROOM, StatusEvent(ws_id="ws-1", turn_count=1))
+            await bot._on_ws_event("ws-1", ROOM, StatusEvent(ws_id="ws-1", turn_count=2))
+
+        _run(scenario())
+
+        assert bot.storage.update_channel_route_recovery_state.call_count == 2
+        bot.storage.update_channel_route_recovery_state.assert_any_call(
+            "matrix", ROOM, last_turn_count=1, last_seen_text=None
+        )
+        bot.storage.update_channel_route_recovery_state.assert_any_call(
+            "matrix", ROOM, last_turn_count=2, last_seen_text=None
+        )
+
+    def test_persist_failure_does_not_block_message_delivery(self) -> None:
+        bot = _make_bot()
+        bot.storage.update_channel_route_recovery_state = MagicMock(  # type: ignore[attr-defined]
+            side_effect=RuntimeError("db down")
+        )
+
+        _run(bot._on_ws_event("ws-1", ROOM, StatusEvent(ws_id="ws-1", turn_count=1)))  # must not raise
+
+        assert bot._last_turn_count["ws-1"] == 1
+
+
+class TestStreamEndPersist:
+    def test_persists_last_seen_text_on_stream_end(self) -> None:
+        bot = _make_bot()
+        bot.storage.update_channel_route_recovery_state = MagicMock()  # type: ignore[attr-defined]
+
+        async def scenario() -> None:
+            await bot._on_ws_event("ws-1", ROOM, ContentEvent(ws_id="ws-1", text="a reply"))
+            await bot._on_ws_event("ws-1", ROOM, StreamEndEvent(ws_id="ws-1"))
+
+        _run(scenario())
+
+        bot.storage.update_channel_route_recovery_state.assert_called_once_with(
+            "matrix", ROOM, last_turn_count=None, last_seen_text="a reply"
+        )
+
+
+class TestRecoverMissedTurnSkipsUnrenderable:
+    """_recover_missed_turn: a tool-call turn mid-walk-back must not abort
+    recovery of the rest of the gap (regression test for the fix that
+    changed the unrenderable-content branch from `break` to `continue`)."""
+
+    def test_skips_tool_call_turn_and_recovers_older_ones(self) -> None:
+        bot = _make_bot()
+        bot.router.get_node_url = AsyncMock(return_value="http://node")  # type: ignore[attr-defined]
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = MagicMock(
+            return_value={
+                "messages": [
+                    {"role": "assistant", "content": "older recoverable reply"},
+                    # A tool-call turn sits between the two recoverable
+                    # text turns -- must be skipped, not treated as a
+                    # stop signal.
+                    {"role": "assistant", "content": [{"type": "text", "text": "tool stuff"}]},
+                    {"role": "assistant", "content": "newest recoverable reply"},
+                ]
+            }
+        )
+        bot._http_client.get = AsyncMock(return_value=response)  # type: ignore[method-assign]
+        bot._send_text = AsyncMock()  # type: ignore[method-assign]
+
+        with patch("turnstone.channels.matrix.bot.asyncio.sleep", AsyncMock()):
+            _run(bot._recover_missed_turn("ws-1", ROOM, 2))
+
+        assert bot._send_text.await_args_list == [
+            ((ROOM, "older recoverable reply"),),
+            ((ROOM, "newest recoverable reply"),),
+        ]
+
+    def test_persists_last_seen_text_after_each_recovered_send(self) -> None:
+        bot = _make_bot()
+        bot.router.get_node_url = AsyncMock(return_value="http://node")  # type: ignore[attr-defined]
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = MagicMock(
+            return_value={"messages": [{"role": "assistant", "content": "the missed reply"}]}
+        )
+        bot._http_client.get = AsyncMock(return_value=response)  # type: ignore[method-assign]
+        bot._send_text = AsyncMock()  # type: ignore[method-assign]
+        bot.storage.update_channel_route_recovery_state = MagicMock()  # type: ignore[attr-defined]
+
+        with patch("turnstone.channels.matrix.bot.asyncio.sleep", AsyncMock()):
+            _run(bot._recover_missed_turn("ws-1", ROOM, 1))
+
+        bot.storage.update_channel_route_recovery_state.assert_called_once_with(
+            "matrix", ROOM, last_turn_count=None, last_seen_text="the missed reply"
+        )

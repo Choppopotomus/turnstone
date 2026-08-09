@@ -1710,7 +1710,9 @@ class PostgreSQLBackend:
             )
             conn.commit()
 
-    def get_channel_route(self, channel_type: str, channel_id: str) -> dict[str, str] | None:
+    def get_channel_route(
+        self, channel_type: str, channel_id: str
+    ) -> dict[str, str | int | None] | None:
 
         with self._conn() as conn:
             row = conn.execute(
@@ -1720,6 +1722,8 @@ class PostgreSQLBackend:
                     channel_routes.c.ws_id,
                     channel_routes.c.node_id,
                     channel_routes.c.created,
+                    channel_routes.c.last_turn_count,
+                    channel_routes.c.last_seen_text,
                 ).where(
                     (channel_routes.c.channel_type == channel_type)
                     & (channel_routes.c.channel_id == channel_id)
@@ -1732,10 +1736,12 @@ class PostgreSQLBackend:
                     "ws_id": row[2],
                     "node_id": row[3],
                     "created": row[4],
+                    "last_turn_count": row[5],
+                    "last_seen_text": row[6],
                 }
             return None
 
-    def get_channel_route_by_ws(self, ws_id: str) -> dict[str, str] | None:
+    def get_channel_route_by_ws(self, ws_id: str) -> dict[str, str | int | None] | None:
 
         with self._conn() as conn:
             row = conn.execute(
@@ -1745,6 +1751,8 @@ class PostgreSQLBackend:
                     channel_routes.c.ws_id,
                     channel_routes.c.node_id,
                     channel_routes.c.created,
+                    channel_routes.c.last_turn_count,
+                    channel_routes.c.last_seen_text,
                 ).where(channel_routes.c.ws_id == ws_id)
             ).fetchone()
             if row:
@@ -1754,10 +1762,14 @@ class PostgreSQLBackend:
                     "ws_id": row[2],
                     "node_id": row[3],
                     "created": row[4],
+                    "last_turn_count": row[5],
+                    "last_seen_text": row[6],
                 }
             return None
 
-    def list_channel_routes_by_type(self, channel_type: str) -> list[dict[str, str]]:
+    def list_channel_routes_by_type(
+        self, channel_type: str
+    ) -> list[dict[str, str | int | None]]:
 
         with self._conn() as conn:
             rows = conn.execute(
@@ -1767,6 +1779,8 @@ class PostgreSQLBackend:
                     channel_routes.c.ws_id,
                     channel_routes.c.node_id,
                     channel_routes.c.created,
+                    channel_routes.c.last_turn_count,
+                    channel_routes.c.last_seen_text,
                 )
                 .where(channel_routes.c.channel_type == channel_type)
                 .order_by(channel_routes.c.created.desc())
@@ -1778,9 +1792,38 @@ class PostgreSQLBackend:
                     "ws_id": r[2],
                     "node_id": r[3],
                     "created": r[4],
+                    "last_turn_count": r[5],
+                    "last_seen_text": r[6],
                 }
                 for r in rows
             ]
+
+    def update_channel_route_recovery_state(
+        self,
+        channel_type: str,
+        channel_id: str,
+        *,
+        last_turn_count: int | None = None,
+        last_seen_text: str | None = None,
+    ) -> None:
+        values: dict[str, int | str] = {}
+        if last_turn_count is not None:
+            values["last_turn_count"] = last_turn_count
+        if last_seen_text is not None:
+            values["last_seen_text"] = last_seen_text
+        if not values:
+            return
+
+        with self._conn() as conn:
+            conn.execute(
+                sa.update(channel_routes)
+                .where(
+                    (channel_routes.c.channel_type == channel_type)
+                    & (channel_routes.c.channel_id == channel_id)
+                )
+                .values(**values)
+            )
+            conn.commit()
 
     def delete_channel_route(self, channel_type: str, channel_id: str) -> bool:
 

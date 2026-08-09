@@ -234,6 +234,14 @@ channel_routes = sa.Table(
     sa.Column("ws_id", sa.Text, nullable=False),
     sa.Column("node_id", sa.Text, nullable=False, server_default=""),
     sa.Column("created", sa.Text, nullable=False),
+    # last_turn_count/last_seen_text: missed-turn-recovery checkpoint, read
+    # by a channel adapter's _recover_routes() to seed its in-memory
+    # reconnect-tracking state so recovery also covers a process restart,
+    # not just a mid-session SSE reconnect. NULL = "never recorded" (no
+    # adapter has written it yet, or this route's channel type doesn't use
+    # the mechanism). Added in migration 068.
+    sa.Column("last_turn_count", sa.Integer),
+    sa.Column("last_seen_text", sa.Text),
     sa.PrimaryKeyConstraint("channel_type", "channel_id"),
 )
 

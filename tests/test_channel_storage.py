@@ -123,3 +123,56 @@ class TestChannelRouteCRUD:
         s = db.get_channel_route("slack", "channel_1")
         assert d is not None and d["ws_id"] == "ws_1"
         assert s is not None and s["ws_id"] == "ws_2"
+
+    def test_new_route_has_null_recovery_state(self, db):
+        db.create_channel_route("discord", "thread_123", "ws_abc")
+        result = db.get_channel_route("discord", "thread_123")
+        assert result is not None
+        assert result["last_turn_count"] is None
+        assert result["last_seen_text"] is None
+
+    def test_update_recovery_state_last_turn_count_only(self, db):
+        db.create_channel_route("matrix", "!room:1", "ws_abc")
+        db.update_channel_route_recovery_state("matrix", "!room:1", last_turn_count=5)
+        result = db.get_channel_route("matrix", "!room:1")
+        assert result is not None
+        assert result["last_turn_count"] == 5
+        assert result["last_seen_text"] is None
+
+    def test_update_recovery_state_last_seen_text_only(self, db):
+        db.create_channel_route("matrix", "!room:1", "ws_abc")
+        db.update_channel_route_recovery_state("matrix", "!room:1", last_seen_text="hello")
+        result = db.get_channel_route("matrix", "!room:1")
+        assert result is not None
+        assert result["last_turn_count"] is None
+        assert result["last_seen_text"] == "hello"
+
+    def test_update_recovery_state_does_not_clobber_other_field(self, db):
+        db.create_channel_route("matrix", "!room:1", "ws_abc")
+        db.update_channel_route_recovery_state("matrix", "!room:1", last_turn_count=3)
+        db.update_channel_route_recovery_state("matrix", "!room:1", last_seen_text="a reply")
+        result = db.get_channel_route("matrix", "!room:1")
+        assert result is not None
+        assert result["last_turn_count"] == 3
+        assert result["last_seen_text"] == "a reply"
+
+    def test_update_recovery_state_visible_via_get_by_ws_and_list(self, db):
+        db.create_channel_route("matrix", "!room:1", "ws_abc")
+        db.update_channel_route_recovery_state(
+            "matrix", "!room:1", last_turn_count=7, last_seen_text=None
+        )
+        db.update_channel_route_recovery_state("matrix", "!room:1", last_seen_text="reply text")
+
+        by_ws = db.get_channel_route_by_ws("ws_abc")
+        assert by_ws is not None
+        assert by_ws["last_turn_count"] == 7
+        assert by_ws["last_seen_text"] == "reply text"
+
+        listed = db.list_channel_routes_by_type("matrix")
+        assert len(listed) == 1
+        assert listed[0]["last_turn_count"] == 7
+        assert listed[0]["last_seen_text"] == "reply text"
+
+    def test_update_recovery_state_nonexistent_route_is_noop(self, db):
+        db.update_channel_route_recovery_state("matrix", "!nobody:1", last_turn_count=1)
+        assert db.get_channel_route("matrix", "!nobody:1") is None

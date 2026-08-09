@@ -1095,20 +1095,40 @@ class StorageBackend(Protocol):
         """Map a channel/thread to a workstream. No-op if exists."""
         ...
 
-    def get_channel_route(self, channel_type: str, channel_id: str) -> dict[str, str] | None:
+    def get_channel_route(
+        self, channel_type: str, channel_id: str
+    ) -> dict[str, str | int | None] | None:
         """Lookup workstream for a channel/thread."""
         ...
 
-    def get_channel_route_by_ws(self, ws_id: str) -> dict[str, str] | None:
+    def get_channel_route_by_ws(self, ws_id: str) -> dict[str, str | int | None] | None:
         """Reverse lookup: find channel/thread for a workstream."""
         ...
 
-    def list_channel_routes_by_type(self, channel_type: str) -> list[dict[str, str]]:
+    def list_channel_routes_by_type(
+        self, channel_type: str
+    ) -> list[dict[str, str | int | None]]:
         """List all routes for a channel type, ordered by created DESC."""
         ...
 
     def delete_channel_route(self, channel_type: str, channel_id: str) -> bool:
         """Remove a channel route. Returns True if existed."""
+        ...
+
+    def update_channel_route_recovery_state(
+        self,
+        channel_type: str,
+        channel_id: str,
+        *,
+        last_turn_count: int | None = None,
+        last_seen_text: str | None = None,
+    ) -> None:
+        """Persist missed-turn-recovery checkpoint state for a route.
+
+        Only the field(s) actually passed get updated -- callers pass
+        exactly one of the two kwargs, since the two write sites
+        (StatusEvent handling, stream-end) never need both at once.
+        """
         ...
 
     # -- Scheduled tasks -------------------------------------------------------

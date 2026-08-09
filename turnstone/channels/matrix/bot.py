@@ -182,7 +182,12 @@ class TurnstoneMatrixBot:
         # session_routes.py) -- that asymmetry is the server's existing,
         # previously-unused signal for "this connect might have missed
         # something". Tracked per ws_id so a bot process serving many
-        # rooms keeps them independent.
+        # rooms keeps them independent. Plain in-memory dicts here, but
+        # _recover_routes() seeds _ever_connected/_last_turn_count/
+        # _last_seen_text from a durable checkpoint (channel_routes'
+        # last_turn_count/last_seen_text columns) before resubscribing,
+        # so this same machinery also covers a bot process restart, not
+        # just a mid-session SSE reconnect.
         self._ever_connected: set[str] = set()
         self._is_reconnect: dict[str, bool] = {}
         self._last_turn_count: dict[str, int] = {}
@@ -479,7 +484,7 @@ class TurnstoneMatrixBot:
         elif isinstance(event, ApprovalResolvedEvent):
             await self._handle_approval_resolved(ws_id, event)
         elif isinstance(event, StreamEndEvent):
-            await self._handle_stream_end(ws_id)
+            await self._handle_stream_end(ws_id, room_id)
         elif isinstance(event, ErrorEvent):
             await self._handle_error(room_id, event)
 
@@ -593,7 +598,7 @@ class TurnstoneMatrixBot:
             label = "Approved" if event.approved else "Denied"
             await self._send_text(entry["room_id"], label)
 
-    async def _handle_stream_end(self, ws_id: str) -> None:
+    async def _handle_stream_end(self, ws_id: str, room_id: str) -> None:
         sm = self._streaming.pop(ws_id, None)
         if sm is not None:
             await sm.finalize()
@@ -602,6 +607,7 @@ class TurnstoneMatrixBot:
                 # _recover_missed_turn) can tell "already sent" apart
                 # from "genuinely new" and never double-post.
                 self._last_seen_text[ws_id] = sm.accumulated_text
+                await self._persist_recovery_state(room_id, last_seen_text=sm.accumulated_text)
 
         reply_room = self._notify_reply_rooms.pop(ws_id, None)
         if reply_room is not None and sm is not None and sm.accumulated_text:
@@ -628,6 +634,11 @@ class TurnstoneMatrixBot:
     async def _handle_status(self, ws_id: str, room_id: str, event: StatusEvent) -> None:
         prev_turn_count = self._last_turn_count.get(ws_id)
         self._last_turn_count[ws_id] = event.turn_count
+        if event.turn_count != prev_turn_count:
+            # Persist once per real turn_count change, not once per
+            # StatusEvent -- a tool-heavy turn emits one StatusEvent per
+            # LLM API round-trip, all carrying the same turn_count.
+            await self._persist_recovery_state(room_id, last_turn_count=event.turn_count)
         if prev_turn_count is None or event.turn_count <= prev_turn_count:
             return
         if not self._is_reconnect.get(ws_id):
@@ -714,9 +725,12 @@ class TurnstoneMatrixBot:
             # Only plain-text turns -- tool-call/multipart turns need
             # the full renderer this recovery path doesn't have, and
             # guessing at a partial render risks looking more broken
-            # than staying silent.
+            # than staying silent. Skip (not abort) so an unrenderable
+            # turn doesn't drop every older turn in the same gap too --
+            # only the known-already-sent boundary below should stop the
+            # walk-back entirely.
             if not isinstance(content, str) or not content:
-                break
+                continue
             if content == self._last_seen_text.get(ws_id):
                 break
             to_send.append(content)
@@ -730,8 +744,36 @@ class TurnstoneMatrixBot:
                 return
             await self._send_text(room_id, content)
             self._last_seen_text[ws_id] = content
+            # Persist immediately, not just at the next ordinary
+            # stream-end -- a crash partway through a multi-turn
+            # walk-back must not leave a stale checkpoint that causes
+            # this same turn to be recovered (and re-sent) again.
+            await self._persist_recovery_state(room_id, last_seen_text=content)
 
     # -- helpers -------------------------------------------------------------
+
+    async def _persist_recovery_state(
+        self,
+        room_id: str,
+        *,
+        last_turn_count: int | None = None,
+        last_seen_text: str | None = None,
+    ) -> None:
+        """Best-effort checkpoint write for restart-time recovery seeding
+        (see _recover_routes). Never blocks or breaks live message
+        delivery on failure -- a missed checkpoint just degrades the next
+        restart's recovery to today's behavior, it isn't fatal.
+        """
+        try:
+            await asyncio.to_thread(
+                self.storage.update_channel_route_recovery_state,
+                "matrix",
+                room_id,
+                last_turn_count=last_turn_count,
+                last_seen_text=last_seen_text,
+            )
+        except Exception:
+            log.warning("matrix.recovery_state_persist_failed", room_id=room_id, exc_info=True)
 
     async def _send_text(self, room_id: str, text: str) -> None:
         """Send a text message to a Matrix room."""
@@ -783,12 +825,32 @@ class TurnstoneMatrixBot:
         self._notify_ws_map[ws_id] = (ws_id, room_id)
 
     async def _recover_routes(self) -> None:
-        """Re-subscribe to SSE streams for existing matrix routes."""
+        """Re-subscribe to SSE streams for existing matrix routes.
+
+        Also seeds missed-turn-recovery state from the last persisted
+        checkpoint, if any, so a bot process restart is covered by the
+        same reconnect-recovery machinery as a mid-session SSE reconnect
+        -- _handle_connected/_handle_status need no changes for this,
+        they just need _ever_connected/_last_turn_count to be non-empty
+        when the first post-restart ConnectedEvent/StatusEvent arrive.
+        """
         routes = await asyncio.to_thread(
             self.storage.list_channel_routes_by_type, "matrix"
         )
         for route in routes:
             ws_id = route["ws_id"]
             room_id = route["channel_id"]
+            last_turn_count = route.get("last_turn_count")
+            if last_turn_count is not None:
+                self._ever_connected.add(ws_id)
+                self._last_turn_count[ws_id] = last_turn_count
+                last_seen_text = route.get("last_seen_text")
+                if last_seen_text is not None:
+                    self._last_seen_text[ws_id] = last_seen_text
+                log.info(
+                    "matrix.restart_recovery_seeded",
+                    ws_id=ws_id,
+                    last_turn_count=last_turn_count,
+                )
             await self.subscribe_ws(ws_id, room_id)
             log.info("matrix.route_recovered", ws_id=ws_id, room_id=room_id)
