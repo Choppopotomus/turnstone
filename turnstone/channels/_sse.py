@@ -61,15 +61,18 @@ async def run_sse_stream(
     """
     delay = SSE_RECONNECT_DELAY
     url = ""
+    last_event_id: str | None = None
 
     while True:
         try:
             node_base = await node_url_fn(ws_id)
             url = f"{node_base}/v1/api/workstreams/{ws_id}/events"
 
-            sse_headers: dict[str, str] | None = None
+            sse_headers: dict[str, str] = {}
             if token_factory is not None:
-                sse_headers = {"Authorization": f"Bearer {token_factory()}"}
+                sse_headers["Authorization"] = f"Bearer {token_factory()}"
+            if last_event_id is not None:
+                sse_headers["Last-Event-ID"] = last_event_id
 
             async with httpx_sse.aconnect_sse(
                 http_client,
@@ -106,6 +109,9 @@ async def run_sse_stream(
 
                 delay = SSE_RECONNECT_DELAY  # reset on successful connect
                 async for sse in event_source.aiter_sse():
+                    sse_id = getattr(sse, "id", None)
+                    if sse_id:
+                        last_event_id = sse_id
                     if sse.event != "message" and sse.event:
                         continue
                     try:

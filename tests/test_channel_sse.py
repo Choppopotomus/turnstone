@@ -19,9 +19,10 @@ def _run(coro):  # type: ignore[no-untyped-def]
 class _FakeSSEEvent:
     """A fake ``httpx_sse.ServerSentEvent`` with the subset we read."""
 
-    def __init__(self, event: str, data: str) -> None:
+    def __init__(self, event: str, data: str, id: str = "") -> None:  # noqa: A002
         self.event = event
         self.data = data
+        self.id = id
 
 
 class _FakeEventSource:
@@ -62,9 +63,11 @@ class _FakeConnect:
     def __init__(self, queue: list[_FakeEventSource]) -> None:
         self._queue = queue
         self.call_count = 0
+        self.calls: list[dict] = []  # kwargs from each aconnect_sse() call
 
     def __call__(self, *args, **kwargs):  # noqa: ANN001, ANN204
         self.call_count += 1
+        self.calls.append(kwargs)
         if not self._queue:
             raise asyncio.CancelledError
         return self._queue.pop(0)
@@ -158,6 +161,106 @@ class TestStaleRoute:
         on_stale.assert_awaited_once()
         # Still a single connect — no livelock.
         assert fake_connect.call_count == 1
+
+
+# ---------------------------------------------------------------------------
+# Last-Event-ID resume (dispatch-silence fix, 2026-08-09)
+#
+# Prior to this fix, run_sse_stream never sent Last-Event-ID on reconnect,
+# so the server always treated a reconnect as "fresh" and skipped its own
+# replay_ok buffered-event path — silently losing any turn whose content
+# was emitted entirely during the disconnected window.
+# ---------------------------------------------------------------------------
+
+
+class TestLastEventIdResume:
+    def test_first_connect_sends_no_last_event_id(self, monkeypatch, _fast_sleep):
+        from turnstone.channels import _sse
+
+        queue = [_FakeEventSource(status_code=404, events=[])]
+        fake_connect = _FakeConnect(queue)
+        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
+
+        async def node_url_fn(ws_id: str) -> str:
+            return "http://node"
+
+        _run(
+            _sse.run_sse_stream(
+                http_client=MagicMock(),
+                log_prefix="test",
+                ws_id="ws-1",
+                node_url_fn=node_url_fn,
+                token_factory=None,
+                on_event=AsyncMock(),
+                on_stale=AsyncMock(),
+            )
+        )
+
+        assert "Last-Event-ID" not in fake_connect.calls[0]["headers"]
+
+    def test_reconnect_after_event_sends_last_event_id(self, monkeypatch, _fast_sleep):
+        """A received event's ``id`` must be sent as Last-Event-ID on the
+        NEXT connection attempt, so the server can serve replay_ok instead
+        of dropping straight to a fresh (no-history) reconnect."""
+        from turnstone.channels import _sse
+
+        seen_event = _FakeSSEEvent(event="message", data=_valid_event_data(), id="42")
+        queue = [
+            _FakeEventSource(status_code=200, events=[seen_event]),
+            _FakeEventSource(status_code=404, events=[]),
+        ]
+        fake_connect = _FakeConnect(queue)
+        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
+
+        async def node_url_fn(ws_id: str) -> str:
+            return "http://node"
+
+        _run(
+            _sse.run_sse_stream(
+                http_client=MagicMock(),
+                log_prefix="test",
+                ws_id="ws-1",
+                node_url_fn=node_url_fn,
+                token_factory=None,
+                on_event=AsyncMock(),
+                on_stale=AsyncMock(),
+            )
+        )
+
+        assert fake_connect.call_count == 2
+        assert "Last-Event-ID" not in fake_connect.calls[0]["headers"]
+        assert fake_connect.calls[1]["headers"]["Last-Event-ID"] == "42"
+
+    def test_events_without_id_do_not_clear_last_event_id(self, monkeypatch, _fast_sleep):
+        """A synthetic/replay event with no ``id`` must not blow away a
+        previously-seen real id — only a truthy id updates the cursor."""
+        from turnstone.channels import _sse
+
+        with_id = _FakeSSEEvent(event="message", data=_valid_event_data(), id="7")
+        without_id = _FakeSSEEvent(event="message", data=_valid_event_data(), id="")
+        queue = [
+            _FakeEventSource(status_code=200, events=[with_id, without_id]),
+            _FakeEventSource(status_code=404, events=[]),
+        ]
+        fake_connect = _FakeConnect(queue)
+        monkeypatch.setattr(_sse.httpx_sse, "aconnect_sse", fake_connect)
+
+        async def node_url_fn(ws_id: str) -> str:
+            return "http://node"
+
+        _run(
+            _sse.run_sse_stream(
+                http_client=MagicMock(),
+                log_prefix="test",
+                ws_id="ws-1",
+                node_url_fn=node_url_fn,
+                token_factory=None,
+                on_event=AsyncMock(),
+                on_stale=AsyncMock(),
+            )
+        )
+
+        assert fake_connect.calls[1]["headers"]["Last-Event-ID"] == "7"
 
 
 # ---------------------------------------------------------------------------

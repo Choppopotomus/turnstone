@@ -42,10 +42,13 @@ from turnstone.core.log import get_logger
 from turnstone.sdk.events import (
     ApprovalResolvedEvent,
     ApproveRequestEvent,
+    ConnectedEvent,
     ContentEvent,
     ErrorEvent,
+    InProgressSnapshotEvent,
     IntentVerdictEvent,
     ServerEvent,
+    StatusEvent,
     StreamEndEvent,
     ThinkingStartEvent,
     ThinkingStopEvent,
@@ -89,6 +92,10 @@ class StreamingMessage:
 
     async def append(self, text: str) -> None:
         self._buffer.append(text)
+
+    async def replace(self, text: str) -> None:
+        """Replace the buffer wholesale — for a one-shot snapshot, not a delta."""
+        self._buffer = [text]
 
     async def finalize(self) -> None:
         content = "".join(self._buffer)
@@ -168,6 +175,22 @@ class TurnstoneMatrixBot:
         self._pending_approval: dict[tuple[str, str], dict[str, Any]] = {}
         self._notify_ws_map: dict[str, tuple[str, str]] = {}
         self._notify_reply_rooms: dict[str, str] = {}
+
+        # -- missed-turn recovery (turn-completes-entirely-during-disconnect) --
+        # ``connected``/``status`` replay on every fresh/truncated SSE
+        # reconnect but never on a seamless ``replay_ok`` one (see
+        # session_routes.py) -- that asymmetry is the server's existing,
+        # previously-unused signal for "this connect might have missed
+        # something". Tracked per ws_id so a bot process serving many
+        # rooms keeps them independent.
+        self._ever_connected: set[str] = set()
+        self._is_reconnect: dict[str, bool] = {}
+        self._last_turn_count: dict[str, int] = {}
+        self._last_seen_text: dict[str, str] = {}
+        # Keyed by ws_id, not a flat set: doubles as both the re-entrancy
+        # guard (one recovery in flight per ws_id) and the handle needed to
+        # cancel a running recovery on unsubscribe/stale-route cleanup.
+        self._recovery_tasks: dict[str, asyncio.Task[None]] = {}
 
         headers: dict[str, str] = {}
         if api_token and not server_token_factory:
@@ -384,10 +407,23 @@ class TurnstoneMatrixBot:
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
         self._pop_ws_approvals(ws_id)
+        await self._pop_ws_recovery_state(ws_id)
         log.info("matrix.unsubscribed", ws_id=ws_id)
 
     def _pop_ws_approvals(self, ws_id: str) -> None:
         pop_ws_entries(self._pending_approval, ws_id)
+
+    async def _pop_ws_recovery_state(self, ws_id: str) -> None:
+        self._ever_connected.discard(ws_id)
+        self._is_reconnect.pop(ws_id, None)
+        self._last_turn_count.pop(ws_id, None)
+        self._last_seen_text.pop(ws_id, None)
+
+        task = self._recovery_tasks.pop(ws_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     async def _cleanup_stale_route(self, ws_id: str, room_id: str) -> None:
         await self.router.delete_route("matrix", room_id)
@@ -395,6 +431,7 @@ class TurnstoneMatrixBot:
         self._subscribed_ws.discard(ws_id)
         self._streaming.pop(ws_id, None)
         self._pop_ws_approvals(ws_id)
+        await self._pop_ws_recovery_state(ws_id)
         log.info("matrix.stale_route_removed", ws_id=ws_id)
 
     # -- SSE listener --------------------------------------------------------
@@ -429,6 +466,12 @@ class TurnstoneMatrixBot:
 
         if isinstance(event, ContentEvent):
             await self._handle_content(ws_id, room_id, event)
+        elif isinstance(event, InProgressSnapshotEvent):
+            await self._handle_in_progress_snapshot(ws_id, room_id, event)
+        elif isinstance(event, ConnectedEvent):
+            await self._handle_connected(ws_id)
+        elif isinstance(event, StatusEvent):
+            await self._handle_status(ws_id, room_id, event)
         elif isinstance(event, ApproveRequestEvent):
             await self._handle_approve_request(ws_id, room_id, event)
         elif isinstance(event, IntentVerdictEvent):
@@ -450,6 +493,27 @@ class TurnstoneMatrixBot:
             )
             self._streaming[ws_id] = sm
         await sm.append(event.text)
+
+    async def _handle_in_progress_snapshot(
+        self, ws_id: str, room_id: str, event: InProgressSnapshotEvent
+    ) -> None:
+        """Recover a mid-turn reconnect: the server replays the full in-flight
+        content on a fresh SSE connect (e.g. after a network blip), but until
+        now the bot silently dropped it and lost the turn. This is a one-shot
+        snapshot of everything generated so far, not an incremental delta —
+        it replaces, not appends.
+        """
+        if not event.content:
+            return
+        sm = self._streaming.get(ws_id)
+        if sm is None:
+            sm = StreamingMessage(
+                client=self._client,
+                room_id=room_id,
+                max_length=self.config.max_message_length,
+            )
+            self._streaming[ws_id] = sm
+        await sm.replace(event.content)
 
     async def _handle_approve_request(
         self,
@@ -533,6 +597,11 @@ class TurnstoneMatrixBot:
         sm = self._streaming.pop(ws_id, None)
         if sm is not None:
             await sm.finalize()
+            if sm.accumulated_text:
+                # So a later missed-turn recovery check (see
+                # _recover_missed_turn) can tell "already sent" apart
+                # from "genuinely new" and never double-post.
+                self._last_seen_text[ws_id] = sm.accumulated_text
 
         reply_room = self._notify_reply_rooms.pop(ws_id, None)
         if reply_room is not None and sm is not None and sm.accumulated_text:
@@ -543,6 +612,117 @@ class TurnstoneMatrixBot:
     async def _handle_error(self, room_id: str, event: ErrorEvent) -> None:
         safe_msg = event.message[:500] if event.message else "An error occurred"
         await self._send_text(room_id, f"**Error:** {safe_msg}")
+
+    # -- missed-turn recovery -------------------------------------------------
+
+    async def _handle_connected(self, ws_id: str) -> None:
+        """Fires on every fresh/truncated SSE (re)connect, never on a
+        seamless replay_ok one. Record whether this ws has connected
+        before *in this bot process* so the StatusEvent that follows can
+        tell "just subscribed, nothing to recover" apart from "genuine
+        reconnect, might have missed a turn".
+        """
+        self._is_reconnect[ws_id] = ws_id in self._ever_connected
+        self._ever_connected.add(ws_id)
+
+    async def _handle_status(self, ws_id: str, room_id: str, event: StatusEvent) -> None:
+        prev_turn_count = self._last_turn_count.get(ws_id)
+        self._last_turn_count[ws_id] = event.turn_count
+        if prev_turn_count is None or event.turn_count <= prev_turn_count:
+            return
+        if not self._is_reconnect.get(ws_id):
+            return
+        # Consume the reconnect flag now that it's driven a recovery
+        # decision -- otherwise every later ordinary turn on this same
+        # connection also has turn_count > prev and _is_reconnect still
+        # true, re-triggering recovery + a GET /history call forever.
+        self._is_reconnect[ws_id] = False
+        # Re-entrancy guard: a prior recovery for this ws_id may still be
+        # running (e.g. a second reconnect lands before the first recovery
+        # finished). Don't spawn an overlapping one racing on the same
+        # unlocked _last_seen_text entry.
+        if ws_id in self._recovery_tasks:
+            return
+        missed_turns = event.turn_count - prev_turn_count
+        # More turns completed than we last knew about, on a real
+        # reconnect. Don't block this dispatch loop waiting to find out
+        # if it's recoverable -- run_sse_stream awaits each event
+        # in-order, so blocking here would delay the very
+        # InProgressSnapshotEvent (if any) this check needs to see land
+        # first. Track the task so it can't be GC'd mid-flight.
+        task = asyncio.create_task(self._recover_missed_turn(ws_id, room_id, missed_turns))
+        self._recovery_tasks[ws_id] = task
+        task.add_done_callback(lambda _t, ws_id=ws_id: self._recovery_tasks.pop(ws_id, None))
+
+    async def _recover_missed_turn(self, ws_id: str, room_id: str, missed_turns: int = 1) -> None:
+        """Backstop for turns that completed entirely while disconnected.
+
+        InProgressSnapshotEvent only covers a turn still executing at
+        reconnect time -- a turn that fully committed before we
+        reconnected clears the server's in-flight buffer, so nothing on
+        the live SSE path recovers it. GET /history is the only
+        remaining source of truth for that case.
+
+        Give the same reconnect's replay burst a moment to deliver an
+        InProgressSnapshotEvent (same connection, no real network hop --
+        this is a scheduling margin, not a network wait). If something
+        shows up to stream-resume, the normal ContentEvent/StreamEndEvent
+        path handles it and there is nothing to recover here.
+
+        ``missed_turns`` is the turn_count jump observed at reconnect --
+        walk back that many assistant turns, not just the latest one, so
+        a disconnect spanning multiple completed turns doesn't
+        permanently drop the earlier ones.
+        """
+        await asyncio.sleep(0.5)
+        if ws_id in self._streaming:
+            return
+
+        try:
+            node_base = await self.router.get_node_url(ws_id)
+            headers: dict[str, str] = {}
+            if self._token_factory is not None:
+                headers["Authorization"] = f"Bearer {self._token_factory()}"
+            resp = await self._http_client.get(
+                f"{node_base}/v1/api/workstreams/{ws_id}/history",
+                params={"limit": max(missed_turns * 2, 5)},
+                headers=headers,
+                # A lightweight lookup shouldn't inherit the client's 90s
+                # read timeout meant for long-running turn requests.
+                timeout=httpx.Timeout(10.0),
+            )
+            resp.raise_for_status()
+            messages = resp.json().get("messages", [])
+        except Exception:
+            log.warning("matrix.missed_turn_history_fetch_failed", ws_id=ws_id, exc_info=True)
+            return
+
+        to_send: list[str] = []
+        for msg in reversed(messages):
+            if len(to_send) >= missed_turns:
+                break
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            # Only plain-text turns -- tool-call/multipart turns need
+            # the full renderer this recovery path doesn't have, and
+            # guessing at a partial render risks looking more broken
+            # than staying silent.
+            if not isinstance(content, str) or not content:
+                break
+            if content == self._last_seen_text.get(ws_id):
+                break
+            to_send.append(content)
+
+        for content in reversed(to_send):
+            # Re-checked per send, not just once up front: a new turn can
+            # start or finish in the time this recovery spent on the HTTP
+            # round-trip / previous send, and the live path should win
+            # over posting stale recovered text out of order.
+            if ws_id in self._streaming:
+                return
+            await self._send_text(room_id, content)
+            self._last_seen_text[ws_id] = content
 
     # -- helpers -------------------------------------------------------------
 
