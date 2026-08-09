@@ -88,8 +88,7 @@ normal non-Turnstone traffic (no `X-Turnstone-Ws-Id` header) confirmed
 byte-identical to pre-patch behavior via a direct request + debug-log check.
 
 **Status:** DEPLOYED and live-verified, 2026-08-09. Register task `ba85d3d4`.
-Known gap, not yet fixed: `[models.council]` still has the same missing
-`api_key` / wrong `model` sentinel bugs originally found alongside this on
-`[models.poe]` — the council alias itself was never patched, only its
-model-family sibling. `[models.council]`'s new bridge support is otherwise
-in place (same shared code path) once that's fixed.
+`[models.council]`'s matching `api_key`/`model` sentinel bugs (same two bugs
+originally found on `[models.poe]`) fixed same day — verified via a live
+chat completion through port 9997 returning 200 with real content. No known
+gaps remain.
