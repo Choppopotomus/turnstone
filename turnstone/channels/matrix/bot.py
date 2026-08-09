@@ -654,7 +654,9 @@ class TurnstoneMatrixBot:
         self._recovery_tasks[ws_id] = task
         task.add_done_callback(lambda _t, ws_id=ws_id: self._recovery_tasks.pop(ws_id, None))
 
-    async def _recover_missed_turn(self, ws_id: str, room_id: str, missed_turns: int = 1) -> None:
+    async def _recover_missed_turn(
+        self, ws_id: str, room_id: str, missed_turns: int = 1, delay: float = 0.5
+    ) -> None:
         """Backstop for turns that completed entirely while disconnected.
 
         InProgressSnapshotEvent only covers a turn still executing at
@@ -673,8 +675,13 @@ class TurnstoneMatrixBot:
         walk back that many assistant turns, not just the latest one, so
         a disconnect spanning multiple completed turns doesn't
         permanently drop the earlier ones.
+
+        ``delay`` defaults to the real 0.5s scheduling margin above; tests
+        override it to a few milliseconds so the actual race against a
+        concurrently-delivered InProgressSnapshotEvent can be exercised at
+        real (just fast-forwarded) time instead of mocking sleep away.
         """
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(delay)
         if ws_id in self._streaming:
             return
 

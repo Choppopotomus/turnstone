@@ -388,6 +388,53 @@ class TestRecoverMissedTurn:
         bot._send_text.assert_not_called()
 
 
+class TestRecoverMissedTurnRealRace:
+    """Real end-to-end race, not mocked -- neither asyncio.sleep nor
+    _recover_missed_turn is stubbed out. Prior coverage only proved each
+    branch by construction (patching sleep away, or asserting the
+    _streaming guard's value at a single checked instant); this exercises
+    the actual timing race the code's own docstring describes."""
+
+    def test_snapshot_landing_mid_delay_wins_over_history_fallback(self) -> None:
+        bot = _make_bot()
+        bot._http_client.get = AsyncMock()  # type: ignore[method-assign]
+
+        async def scenario() -> None:
+            # Real delay, shrunk to milliseconds -- not mocked away.
+            task = asyncio.create_task(bot._recover_missed_turn("ws-1", ROOM, 1, delay=0.02))
+            await asyncio.sleep(0.005)
+            # The same reconnect's replay burst delivers its snapshot
+            # while the recovery task is genuinely still asleep.
+            await bot._on_ws_event(
+                "ws-1", ROOM, InProgressSnapshotEvent(ws_id="ws-1", content="still streaming")
+            )
+            await task
+
+        _run(scenario())
+
+        bot._http_client.get.assert_not_called()
+        assert bot._streaming["ws-1"].accumulated_text == "still streaming"
+
+    def test_no_snapshot_within_delay_falls_back_to_history(self) -> None:
+        bot = _make_bot()
+        bot.router.get_node_url = AsyncMock(return_value="http://node")  # type: ignore[attr-defined]
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = MagicMock(
+            return_value={"messages": [{"role": "assistant", "content": "the missed reply"}]}
+        )
+        bot._http_client.get = AsyncMock(return_value=response)  # type: ignore[method-assign]
+        bot._send_text = AsyncMock()  # type: ignore[method-assign]
+
+        async def scenario() -> None:
+            # Nothing arrives to stream-resume during the real delay window.
+            await bot._recover_missed_turn("ws-1", ROOM, 1, delay=0.02)
+
+        _run(scenario())
+
+        bot._send_text.assert_awaited_once_with(ROOM, "the missed reply")
+
+
 class TestRecoveryStateCleanup:
     def test_unsubscribe_clears_recovery_state(self) -> None:
         bot = _make_bot()
