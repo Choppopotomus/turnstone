@@ -103,6 +103,8 @@ class StreamingMessage:
         if not content:
             return
 
+        from nio import RoomSendError
+
         chunks = chunk_message(content, self.max_length)
         for i, chunk in enumerate(chunks):
             try:
@@ -115,10 +117,19 @@ class StreamingMessage:
                     },
                     ignore_unverified_devices=True,
                 )
-                if i == 0 and hasattr(resp, "event_id"):
-                    self._event_id = resp.event_id
             except Exception:
                 log.warning("matrix.streaming_message.send_failed", room_id=self.room_id, exc_info=True)
+                continue
+            if isinstance(resp, RoomSendError):
+                log.warning(
+                    "matrix.streaming_message.send_failed",
+                    room_id=self.room_id,
+                    error=resp.message,
+                    status_code=resp.status_code,
+                )
+                continue
+            if i == 0 and hasattr(resp, "event_id"):
+                self._event_id = resp.event_id
 
 
 class TurnstoneMatrixBot:
@@ -776,13 +787,19 @@ class TurnstoneMatrixBot:
             log.warning("matrix.recovery_state_persist_failed", room_id=room_id, exc_info=True)
 
     async def _send_text(self, room_id: str, text: str) -> None:
-        """Send a text message to a Matrix room."""
+        """Send a text message to a Matrix room. Best-effort: logs and
+        continues on failure rather than raising, since this is called
+        from the event-handling loop for routine bot replies and a bad
+        send here shouldn't take down message processing for the room.
+        """
+        from nio import RoomSendError
+
         if self._client is None:
             return
         chunks = chunk_message(text, self.config.max_message_length)
         for chunk in chunks:
             try:
-                await self._client.room_send(
+                resp = await self._client.room_send(
                     room_id=room_id,
                     message_type="m.room.message",
                     content={"msgtype": "m.text", "body": chunk},
@@ -790,11 +807,34 @@ class TurnstoneMatrixBot:
                 )
             except Exception:
                 log.warning("matrix.send_failed", room_id=room_id, exc_info=True)
+                continue
+            if isinstance(resp, RoomSendError):
+                log.warning(
+                    "matrix.send_failed",
+                    room_id=room_id,
+                    error=resp.message,
+                    status_code=resp.status_code,
+                )
 
     async def send(self, channel_id: str, content: str) -> str:
-        """Send a message to a Matrix room. Returns event_id."""
+        """Send a message to a Matrix room. Returns event_id.
+
+        Raises RuntimeError on a failed send (e.g. invalid/unlinked room,
+        not-joined, or a transport error) rather than swallowing it and
+        returning "". nio's room_send() reports protocol-level failures
+        (bad room_id, not joined, etc.) as a returned RoomSendError, not
+        a raised exception -- a plain ``hasattr(resp, "event_id")`` check
+        treats that error object the same as a dropped-attribute success
+        and falls through silently. Callers such as the /notify HTTP
+        handler (_http.py) need to be able to tell a real delivery
+        failure apart from success, so failures here must surface as an
+        exception, not as an empty event_id.
+        """
+        from nio import RoomSendError
+
         if self._client is None:
-            return ""
+            msg = "matrix client not started"
+            raise RuntimeError(msg)
         chunks = chunk_message(content, self.config.max_message_length)
         event_id = ""
         for chunk in chunks:
@@ -805,10 +845,21 @@ class TurnstoneMatrixBot:
                     content={"msgtype": "m.text", "body": chunk},
                     ignore_unverified_devices=True,
                 )
-                if hasattr(resp, "event_id"):
-                    event_id = resp.event_id
-            except Exception:
+            except Exception as exc:
                 log.warning("matrix.send_failed", room_id=channel_id, exc_info=True)
+                msg = f"matrix send failed for room {channel_id}: {exc}"
+                raise RuntimeError(msg) from exc
+            if isinstance(resp, RoomSendError):
+                log.warning(
+                    "matrix.send_failed",
+                    room_id=channel_id,
+                    error=resp.message,
+                    status_code=resp.status_code,
+                )
+                msg = f"matrix room_send failed for room {channel_id}: {resp.status_code} {resp.message}"
+                raise RuntimeError(msg)
+            if hasattr(resp, "event_id"):
+                event_id = resp.event_id
         return event_id
 
     async def send_notification(self, channel_id: str, content: str, ws_id: str) -> str:
