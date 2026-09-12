@@ -349,7 +349,7 @@ class TestMrkdwnFieldEscaping:
             ],
         )
         route = SlackRoute(channel="C01SAPU5414", user_id="U9", thread_ts="1.2")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         client.chat_postMessage.assert_awaited_once()
         body = client.chat_postMessage.call_args[1]["blocks"][0]["text"]["text"]
@@ -382,7 +382,7 @@ class TestMrkdwnFieldEscaping:
             items=[{"call_id": "c-1", "func_name": "evil<!channel>tool", "needs_approval": True}],
         )
         route = SlackRoute(channel="C01SAPU5414", user_id="U9", thread_ts="1.2")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         # Slack-rendered notice is escaped...
         text = client.chat_postMessage.call_args[1]["text"]
@@ -420,7 +420,7 @@ class TestMrkdwnFieldEscaping:
             intent_summary="pings <!channel> & <@U123>",
         )
         route = SlackRoute(channel="C1", user_id="U9", thread_ts="1.2")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         client.chat_update.assert_awaited_once()
         blocks = client.chat_update.call_args[1]["blocks"]
@@ -440,7 +440,7 @@ class TestMrkdwnFieldEscaping:
 
         event = ErrorEvent(ws_id="ws-1", message="boom <!channel> & <@U123>")
         route = SlackRoute(channel="C1", user_id="U9", thread_ts="1.2")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         text = client.chat_postMessage.call_args[1]["text"]
         assert text.startswith("*Error:* ")
@@ -849,7 +849,7 @@ class TestWsEventDispatch:
 
         event = ContentEvent(ws_id="ws-1", text="Hello")
         route = SlackRoute(channel="C1", user_id="U1", thread_ts="123.456")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         assert "ws-1" in bot._streaming  # type: ignore[attr-defined]
 
@@ -860,10 +860,10 @@ class TestWsEventDispatch:
         bot, _client = self._make_ws_bot()
         route = SlackRoute(channel="C1", user_id="U1", thread_ts="123.456")
 
-        _run(bot._on_ws_event("ws-1", route, ContentEvent(ws_id="ws-1", text="Hi")))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), ContentEvent(ws_id="ws-1", text="Hi")))  # type: ignore[attr-defined]
         assert "ws-1" in bot._streaming  # type: ignore[attr-defined]
 
-        _run(bot._on_ws_event("ws-1", route, StreamEndEvent(ws_id="ws-1")))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), StreamEndEvent(ws_id="ws-1")))  # type: ignore[attr-defined]
         assert "ws-1" not in bot._streaming  # type: ignore[attr-defined]
 
     def test_stream_end_no_streaming_is_noop(self) -> None:
@@ -873,7 +873,7 @@ class TestWsEventDispatch:
         bot, _client = self._make_ws_bot()
         route = SlackRoute(channel="C1", user_id="U1", thread_ts="123.456")
 
-        _run(bot._on_ws_event("ws-1", route, StreamEndEvent(ws_id="ws-1")))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), StreamEndEvent(ws_id="ws-1")))  # type: ignore[attr-defined]
         assert "ws-1" not in bot._streaming  # type: ignore[attr-defined]
 
     def test_error_event_posts_message(self) -> None:
@@ -884,7 +884,7 @@ class TestWsEventDispatch:
         route = SlackRoute(channel="C1", user_id="U1", thread_ts="123.456")
 
         event = ErrorEvent(ws_id="ws-1", message="Something went wrong")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         client.chat_postMessage.assert_awaited_once()
         text = client.chat_postMessage.call_args[1]["text"]
@@ -922,7 +922,7 @@ class TestWsEventDispatch:
             ws_id="ws-1", items=[{"func_name": "bash", "needs_approval": True}]
         )
         route = SlackRoute(channel="C1", user_id="U1", thread_ts="123.456")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         router.send_approval.assert_awaited_once_with("ws-1", "", approved=True)
 
@@ -938,7 +938,7 @@ class TestWsEventDispatch:
             items=[{"call_id": "c-1", "func_name": "bash", "needs_approval": True}],
         )
         route = SlackRoute(channel="C1", user_id="U12345", thread_ts="123.456")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         client.chat_postMessage.assert_awaited_once()
         call_kwargs = client.chat_postMessage.call_args[1]
@@ -977,7 +977,7 @@ class TestWsEventDispatch:
             intent_summary="Dangerous",
         )
         route = SlackRoute(channel="C1", user_id="U12345", thread_ts="123.456")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         client.chat_update.assert_awaited_once()
 
@@ -998,7 +998,7 @@ class TestWsEventDispatch:
         # fallback clears the ws's single tracked entry, as before.
         event = ApprovalResolvedEvent(ws_id="ws-1", approved=True)
         route = SlackRoute(channel="C1", user_id="U12345", thread_ts="123.456")
-        _run(bot._on_ws_event("ws-1", route, event))  # type: ignore[attr-defined]
+        _run(bot._on_ws_event("ws-1", route, route.to_channel_id(), event))  # type: ignore[attr-defined]
 
         assert not bot._pending_approval  # type: ignore[attr-defined]
         client.chat_update.assert_awaited_once()

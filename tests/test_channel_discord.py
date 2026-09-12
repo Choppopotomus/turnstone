@@ -513,6 +513,7 @@ class TestWsEventFinalization:
         bot._tool_info_msgs = {}
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
+        bot._last_seen_text = {}
 
         # Use the real _on_ws_event method
         _bind_ws_event_handlers(bot, TurnstoneBot)
@@ -733,6 +734,7 @@ class TestStreamEndBehavior:
         bot._tool_info_msgs = {}
         bot._pending_approval_msgs = {}
         bot._notify_reply_channels = {}
+        bot._last_seen_text = {}
         _bind_ws_event_handlers(bot, TurnstoneBot)
         return bot
 
@@ -1016,6 +1018,7 @@ class TestNotificationTracking:
         bot._tool_info_msgs = {}
         bot._pending_approval_msgs = {}
         bot._notify_ws_map = {}
+        bot._last_seen_text = {}
         bot._MAX_NOTIFY_TRACKING = 100
 
         dm_channel = AsyncMock()

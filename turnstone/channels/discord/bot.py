@@ -29,10 +29,13 @@ from turnstone.core.log import get_logger
 from turnstone.sdk.events import (
     ApprovalResolvedEvent,
     ApproveRequestEvent,
+    ConnectedEvent,
     ContentEvent,
     ErrorEvent,
+    InProgressSnapshotEvent,
     IntentVerdictEvent,
     ServerEvent,
+    StatusEvent,
     StreamEndEvent,
     ThinkingStartEvent,
     ThinkingStopEvent,
@@ -127,6 +130,18 @@ class StreamingMessage:
             self._display = (self._display + text)[: self.max_length]
         now = time.monotonic()
         if now - self._last_edit >= self.edit_interval:
+            await self._flush()
+
+    async def replace(self, text: str) -> None:
+        """Replace the buffer wholesale — for a one-shot snapshot, not a delta.
+
+        Resets ``_display`` too, not just ``_buffer`` — otherwise the next
+        in-place edit would paint pre-disconnect content over the
+        recovered snapshot.
+        """
+        self._buffer = [text]
+        self._display = text[: self.max_length]
+        if time.monotonic() - self._last_edit >= self.edit_interval:
             await self._flush()
 
     async def finalize(self) -> None:
@@ -262,6 +277,26 @@ class TurnstoneBot:
         # Bounded LRU to prevent unbounded growth across long bot uptime.
         self._thread_invokers: OrderedDict[int, int] = OrderedDict()
 
+        # -- missed-turn recovery (turn-completes-entirely-during-disconnect) --
+        # Ported from matrix/bot.py — see its __init__ docstring comment for
+        # the full mechanism. ``connected``/``status`` replay on every
+        # fresh/truncated SSE reconnect but never on a seamless
+        # ``replay_ok`` one; that asymmetry is the server's existing signal
+        # for "this connect might have missed something". Tracked per
+        # ws_id so a bot process serving many channels keeps them
+        # independent. _recover_routes() seeds these from a durable
+        # checkpoint (channel_routes' last_turn_count/last_seen_text
+        # columns) before resubscribing, so this machinery also covers a
+        # bot process restart, not just a mid-session SSE reconnect.
+        self._ever_connected: set[str] = set()
+        self._is_reconnect: dict[str, bool] = {}
+        self._last_turn_count: dict[str, int] = {}
+        self._last_seen_text: dict[str, str] = {}
+        # Keyed by ws_id, not a flat set: doubles as both the re-entrancy
+        # guard (one recovery in flight per ws_id) and the handle needed to
+        # cancel a running recovery on unsubscribe/stale-route cleanup.
+        self._recovery_tasks: dict[str, asyncio.Task[None]] = {}
+
         # Shared HTTP client for SSE connections.
         # Read timeout detects half-open connections (server sends ping=5s
         # keepalives, so 90s is very conservative).
@@ -375,6 +410,17 @@ class TurnstoneBot:
 
         Queries the storage backend for all channel routes of type ``discord``
         and opens SSE connections for each workstream.
+
+        Also seeds missed-turn-recovery state from the last persisted
+        checkpoint, if any, so a bot process restart is covered by the
+        same reconnect-recovery machinery as a mid-session SSE reconnect
+        (see matrix/bot.py's ``_recover_routes`` for the original of this
+        pattern). Unlike matrix, this method can run more than once per
+        process (``_on_resumed`` calls it again after a gateway session
+        resume) — the ``ws_id not in self._last_turn_count`` guard stops a
+        second pass from overwriting a live in-memory count with a staler
+        DB checkpoint, which would otherwise misread the next StatusEvent
+        as a bigger gap than actually occurred and double-post.
         """
         routes = await asyncio.to_thread(self.storage.list_channel_routes_by_type, "discord")
         for route in routes:
@@ -382,6 +428,18 @@ class TurnstoneBot:
             channel_id = int(route["channel_id"])
             channel = self._bot.get_channel(channel_id)
             if channel is not None:
+                last_turn_count = route.get("last_turn_count")
+                if last_turn_count is not None and ws_id not in self._last_turn_count:
+                    self._ever_connected.add(ws_id)
+                    self._last_turn_count[ws_id] = last_turn_count
+                    last_seen_text = route.get("last_seen_text")
+                    if last_seen_text is not None:
+                        self._last_seen_text[ws_id] = last_seen_text
+                    log.info(
+                        "discord.restart_recovery_seeded",
+                        ws_id=ws_id,
+                        last_turn_count=last_turn_count,
+                    )
                 await self.subscribe_ws(ws_id, channel)  # type: ignore[arg-type]
                 log.info("discord.route_recovered", ws_id=ws_id, channel_id=channel_id)
             else:
@@ -430,10 +488,31 @@ class TurnstoneBot:
         stale = [mid for mid, entry in self._notify_ws_map.items() if entry[0] == ws_id]
         for mid in stale:
             del self._notify_ws_map[mid]
+        await self._pop_ws_recovery_state(ws_id)
 
     def _pop_ws_approvals(self, ws_id: str) -> None:
         """Drop every tracked approval embed for *ws_id* (all cycles)."""
         pop_ws_entries(self._pending_approval_msgs, ws_id)
+
+    async def _pop_ws_recovery_state(self, ws_id: str) -> None:
+        """Drop missed-turn-recovery tracking for *ws_id* and cancel any
+        in-flight recovery task.
+
+        Cancelling (not just dropping the task handle) matters: a running
+        recovery re-checks ``_last_seen_text``/``_streaming`` per send, so
+        popping those out from under it without cancelling would defeat
+        its own dedup/re-entrancy checks.
+        """
+        self._ever_connected.discard(ws_id)
+        self._is_reconnect.pop(ws_id, None)
+        self._last_turn_count.pop(ws_id, None)
+        self._last_seen_text.pop(ws_id, None)
+
+        task = self._recovery_tasks.pop(ws_id, None)
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     async def unsubscribe_ws(self, ws_id: str) -> None:
         """Cancel the SSE listener for *ws_id* and clean up streaming state."""
@@ -505,6 +584,12 @@ class TurnstoneBot:
             pass
         elif isinstance(event, ContentEvent):
             await self._handle_content(ws_id, thread, event)
+        elif isinstance(event, InProgressSnapshotEvent):
+            await self._handle_in_progress_snapshot(ws_id, thread, event)
+        elif isinstance(event, ConnectedEvent):
+            await self._handle_connected(ws_id)
+        elif isinstance(event, StatusEvent):
+            await self._handle_status(ws_id, thread, event)
         elif isinstance(event, ToolInfoEvent):
             await self._handle_tool_info(ws_id, thread, event)
         elif isinstance(event, ToolResultEvent):
@@ -516,7 +601,7 @@ class TurnstoneBot:
         elif isinstance(event, ApprovalResolvedEvent):
             await self._handle_approval_resolved(ws_id, event)
         elif isinstance(event, StreamEndEvent):
-            await self._handle_stream_end(ws_id)
+            await self._handle_stream_end(ws_id, thread)
         elif isinstance(event, ErrorEvent):
             safe_msg = event.message[:500] if event.message else "An error occurred"
             await thread.send(f"**Error:** {safe_msg}")
@@ -556,6 +641,38 @@ class TurnstoneBot:
             with contextlib.suppress(Exception):
                 await thinking_msg.delete()
         await sm.append(event.text)
+
+    async def _handle_in_progress_snapshot(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+        event: InProgressSnapshotEvent,
+    ) -> None:
+        """Recover a mid-turn reconnect: the server replays the full in-flight
+        content on a fresh SSE connect (e.g. after a network blip), but
+        without this the bot would silently drop it and lose the turn.
+        This is a one-shot snapshot of everything generated so far, not an
+        incremental delta -- it replaces, not appends.
+        """
+        if not event.content:
+            return
+        # Reuse thinking message as the initial streaming message so the
+        # first flush edits it in-place (mirrors _handle_content).
+        thinking_msg = self._thinking_msgs.pop(ws_id, None)
+        sm = self._streaming.get(ws_id)
+        if sm is None:
+            sm = StreamingMessage(
+                channel=thread,
+                max_length=self.config.max_message_length,
+                edit_interval=self.config.streaming_edit_interval,
+            )
+            if thinking_msg is not None:
+                sm.message = thinking_msg
+            self._streaming[ws_id] = sm
+        elif thinking_msg is not None:
+            with contextlib.suppress(Exception):
+                await thinking_msg.delete()
+        await sm.replace(event.content)
 
     async def _handle_tool_info(
         self,
@@ -817,7 +934,7 @@ class TurnstoneBot:
             except Exception:
                 log.debug("discord.approval_resolved_edit_failed", ws_id=ws_id)
 
-    async def _handle_stream_end(self, ws_id: str) -> None:
+    async def _handle_stream_end(self, ws_id: str, thread: discord.abc.Messageable) -> None:
         # Edge-case cleanup: clear any lingering thinking indicator.
         thinking_msg = self._thinking_msgs.pop(ws_id, None)
         if thinking_msg is not None:
@@ -827,6 +944,12 @@ class TurnstoneBot:
         sm = self._streaming.pop(ws_id, None)
         if sm is not None:
             await sm.finalize()
+            if sm.accumulated_text:
+                # So a later missed-turn recovery check (see
+                # _recover_missed_turn) can tell "already sent" apart
+                # from "genuinely new" and never double-post.
+                self._last_seen_text[ws_id] = sm.accumulated_text
+                await self._persist_recovery_state(str(thread.id), last_seen_text=sm.accumulated_text)
         # Forward accumulated response to notification reply DM if active.
         dm_entry = self._notify_reply_channels.pop(ws_id, None)
         if dm_entry is not None and sm is not None:
@@ -846,6 +969,164 @@ class TurnstoneBot:
                     self._track_notification(last_msg.id, ws_id, target_user_id)
         # Clean up pending approval message tracking (all cycles).
         self._pop_ws_approvals(ws_id)
+
+    # -- missed-turn recovery -------------------------------------------------
+
+    async def _handle_connected(self, ws_id: str) -> None:
+        """Fires on every fresh/truncated SSE (re)connect, never on a
+        seamless replay_ok one. Record whether this ws has connected
+        before *in this bot process* so the StatusEvent that follows can
+        tell "just subscribed, nothing to recover" apart from "genuine
+        reconnect, might have missed a turn".
+        """
+        self._is_reconnect[ws_id] = ws_id in self._ever_connected
+        self._ever_connected.add(ws_id)
+
+    async def _handle_status(
+        self, ws_id: str, thread: discord.abc.Messageable, event: StatusEvent
+    ) -> None:
+        prev_turn_count = self._last_turn_count.get(ws_id)
+        self._last_turn_count[ws_id] = event.turn_count
+        if event.turn_count != prev_turn_count:
+            # Persist once per real turn_count change, not once per
+            # StatusEvent -- a tool-heavy turn emits one StatusEvent per
+            # LLM API round-trip, all carrying the same turn_count.
+            await self._persist_recovery_state(str(thread.id), last_turn_count=event.turn_count)
+        if prev_turn_count is None or event.turn_count <= prev_turn_count:
+            return
+        if not self._is_reconnect.get(ws_id):
+            return
+        # Consume the reconnect flag now that it's driven a recovery
+        # decision -- otherwise every later ordinary turn on this same
+        # connection also has turn_count > prev and _is_reconnect still
+        # true, re-triggering recovery + a GET /history call forever.
+        self._is_reconnect[ws_id] = False
+        # Re-entrancy guard: a prior recovery for this ws_id may still be
+        # running (e.g. a second reconnect lands before the first recovery
+        # finished). Don't spawn an overlapping one racing on the same
+        # unlocked _last_seen_text entry.
+        if ws_id in self._recovery_tasks:
+            return
+        missed_turns = event.turn_count - prev_turn_count
+        # More turns completed than we last knew about, on a real
+        # reconnect. Don't block this dispatch loop waiting to find out
+        # if it's recoverable -- run_sse_stream awaits each event
+        # in-order, so blocking here would delay the very
+        # InProgressSnapshotEvent (if any) this check needs to see land
+        # first. Track the task so it can't be GC'd mid-flight.
+        task = asyncio.create_task(self._recover_missed_turn(ws_id, thread, missed_turns))
+        self._recovery_tasks[ws_id] = task
+        task.add_done_callback(lambda _t, ws_id=ws_id: self._recovery_tasks.pop(ws_id, None))
+
+    async def _recover_missed_turn(
+        self,
+        ws_id: str,
+        thread: discord.abc.Messageable,
+        missed_turns: int = 1,
+        delay: float = 0.5,
+    ) -> None:
+        """Backstop for turns that completed entirely while disconnected.
+
+        Ported from matrix/bot.py's ``_recover_missed_turn`` -- see there
+        for the full mechanism doc (InProgressSnapshotEvent race, why
+        GET /history is the only remaining source of truth for a turn
+        that fully committed before reconnect, and why ``delay`` is
+        test-overridable).
+        """
+        await asyncio.sleep(delay)
+        if ws_id in self._streaming:
+            return
+
+        try:
+            node_base = await self.router.get_node_url(ws_id)
+            headers: dict[str, str] = {}
+            if self._token_factory is not None:
+                headers["Authorization"] = f"Bearer {self._token_factory()}"
+            resp = await self._http_client.get(
+                f"{node_base}/v1/api/workstreams/{ws_id}/history",
+                params={"limit": max(missed_turns * 2, 5)},
+                headers=headers,
+                # A lightweight lookup shouldn't inherit the client's 90s
+                # read timeout meant for long-running turn requests.
+                timeout=httpx.Timeout(10.0),
+            )
+            resp.raise_for_status()
+            messages = resp.json().get("messages", [])
+        except Exception:
+            log.warning("discord.missed_turn_history_fetch_failed", ws_id=ws_id, exc_info=True)
+            return
+
+        to_send: list[str] = []
+        for msg in reversed(messages):
+            if len(to_send) >= missed_turns:
+                break
+            if msg.get("role") != "assistant":
+                continue
+            content = msg.get("content")
+            # Only plain-text turns -- tool-call/multipart turns need the
+            # full renderer this recovery path doesn't have. Skip (not
+            # abort) so an unrenderable turn doesn't drop every older
+            # turn in the same gap too.
+            if not isinstance(content, str) or not content:
+                continue
+            if content == self._last_seen_text.get(ws_id):
+                break
+            to_send.append(content)
+
+        channel_id = str(thread.id)
+        for content in reversed(to_send):
+            # Re-checked per send, not just once up front: a new turn can
+            # start or finish in the time this recovery spent on the HTTP
+            # round-trip / previous send, and the live path should win
+            # over posting stale recovered text out of order.
+            if ws_id in self._streaming:
+                return
+            await self._send_recovered_text(thread, content)
+            self._last_seen_text[ws_id] = content
+            # Persist immediately, not just at the next ordinary
+            # stream-end -- a crash partway through a multi-turn
+            # walk-back must not leave a stale checkpoint that causes
+            # this same turn to be recovered (and re-sent) again.
+            await self._persist_recovery_state(channel_id, last_seen_text=content)
+
+    async def _send_recovered_text(self, thread: discord.abc.Messageable, text: str) -> None:
+        """Send recovered history text to *thread*. Best-effort, mirroring
+        ``send()``'s mention-escaping -- logs and continues per chunk on
+        failure rather than raising, since this runs from a detached
+        recovery task with no caller to report to.
+        """
+        import discord
+
+        content = discord.utils.escape_mentions(text)
+        for chunk in chunk_message(content, self.config.max_message_length):
+            try:
+                await thread.send(chunk)
+            except Exception:
+                log.warning("discord.recovered_send_failed", exc_info=True)
+                continue
+
+    async def _persist_recovery_state(
+        self,
+        channel_id: str,
+        *,
+        last_turn_count: int | None = None,
+        last_seen_text: str | None = None,
+    ) -> None:
+        """Best-effort checkpoint write for restart-time recovery seeding
+        (see _recover_routes). Never blocks or breaks live message
+        delivery on failure -- a missed checkpoint just degrades the next
+        restart's recovery to today's behavior, it isn't fatal.
+        """
+        try:
+            await asyncio.to_thread(
+                self.storage.update_channel_route_recovery_state,
+                "discord",
+                channel_id,
+                last_turn_count=last_turn_count,
+                last_seen_text=last_seen_text,
+            )
+        except Exception:
+            log.warning("discord.recovery_state_persist_failed", channel_id=channel_id, exc_info=True)
 
     # -- helpers -------------------------------------------------------------
 
