@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import os
 import socket
 import sys
@@ -128,6 +129,15 @@ def _build_parser() -> argparse.ArgumentParser:
         help="CA cert file to trust for the Matrix homeserver connection "
         "(e.g. a self-signed cert); empty = default system trust "
         "(default: $TURNSTONE_MATRIX_CA_CERT)",
+    )
+    parser.add_argument(
+        "--matrix-room-personas",
+        default=os.environ.get("TURNSTONE_MATRIX_ROOM_PERSONAS", ""),
+        help="JSON object mapping a Matrix room display name to a model "
+        "alias, e.g. '{\"Council\": \"council\"}' -- a new workstream "
+        "created in a matching room uses that model instead of the server "
+        "default. Empty = every room uses the server default (prior "
+        "behavior). (default: $TURNSTONE_MATRIX_ROOM_PERSONAS)",
     )
 
     # -- HTTP server ---------------------------------------------------------
@@ -317,6 +327,16 @@ def _build_adapters(
         from turnstone.channels.matrix.bot import TurnstoneMatrixBot
         from turnstone.channels.matrix.config import MatrixConfig
 
+        room_personas: dict[str, str] = {}
+        if args.matrix_room_personas:
+            try:
+                room_personas = json.loads(args.matrix_room_personas)
+            except (json.JSONDecodeError, TypeError):
+                log.warning(
+                    "matrix.room_personas_parse_failed",
+                    raw=args.matrix_room_personas,
+                )
+
         matrix_config = MatrixConfig(
             server_url=server_url,
             model=args.model,
@@ -329,6 +349,7 @@ def _build_adapters(
                 "~/.local/share/turnstone/matrix-store"
             ),
             ca_cert_path=args.matrix_ca_cert,
+            room_personas=room_personas,
         )
         matrix_bot = TurnstoneMatrixBot(
             matrix_config,

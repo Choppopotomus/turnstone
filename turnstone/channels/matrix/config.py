@@ -23,3 +23,8 @@ class MatrixConfig(ChannelConfig):
     allowed_rooms: list[str] = ""  # empty = all rooms
     max_message_length: int = 16384  # Matrix supports large messages
     ca_cert_path: str = ""  # trust a self-signed homeserver cert; empty = default system trust
+    # Room display name (case-insensitive) -> model alias, e.g.
+    # {"Council": "council"}. A new workstream created in a matching room
+    # uses that model instead of the server default. Unmatched/empty = prior
+    # behavior (server default for every room).
+    room_personas: dict[str, str] | None = None

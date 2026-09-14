@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import signal
 import ssl
 from dataclasses import dataclass, field
@@ -63,6 +64,11 @@ if TYPE_CHECKING:
     from turnstone.core.storage._protocol import StorageBackend
 
 log = get_logger(__name__)
+
+# Matches the exact reply text the approval prompt asks for (bot.py's own
+# "Reply with `approve {cycle_id[:8]}`" line) -- case-insensitive since
+# phone keyboards auto-capitalize.
+_APPROVAL_REPLY_RE = re.compile(r"^(approve|deny)\s+([0-9a-f-]{4,})\s*$", re.IGNORECASE)
 
 # Matrix has generous message limits but we cap for readability.
 _MAX_INBOUND_MESSAGE_LEN: int = 16384
@@ -359,17 +365,52 @@ class TurnstoneMatrixBot:
         # Check if this room has an active session
         ws_id = await self._get_room_ws(room_id)
 
+        # An "approve <id>"/"deny <id>" reply to a pending Tool Approval
+        # Required prompt was previously forwarded to the model as a plain
+        # chat message -- nothing ever consulted _pending_approval, so the
+        # code the user was told to send back had no effect. Intercept it
+        # here instead of routing it into the conversation.
+        if ws_id is not None:
+            match = _APPROVAL_REPLY_RE.match(text)
+            if match:
+                verb, prefix = match.group(1).lower(), match.group(2).lower()
+                cycle_id = self._resolve_pending_cycle_id(ws_id, prefix)
+                if cycle_id is None:
+                    await self._send_text(
+                        room_id,
+                        f"No pending approval matches `{prefix}` "
+                        "-- it may already be resolved or timed out.",
+                    )
+                else:
+                    await self.router.send_approval(
+                        ws_id, cycle_id, approved=(verb == "approve")
+                    )
+                    log.info(
+                        "matrix.approval_reply_handled",
+                        ws_id=ws_id,
+                        cycle_id=cycle_id,
+                        approved=(verb == "approve"),
+                    )
+                return
+
         if ws_id is None:
-            # Create new workstream for this room
+            # Create new workstream for this room, routed to a persona-
+            # specific model when the room's display name matches
+            # config.room_personas (case-insensitive) -- e.g. a room named
+            # "Council" gets model="council" instead of the server default.
+            model = self._persona_for_room(room)
             try:
                 ws_id, _ = await self.router.get_or_create_workstream(
                     channel_type="matrix",
                     channel_id=room_id,
                     name=f"matrix-{room_id[:16]}",
+                    model=model,
                     client_type="chat",
                 )
                 await self.subscribe_ws(ws_id, room_id)
-                log.info("matrix.session_created", ws_id=ws_id, room_id=room_id)
+                log.info(
+                    "matrix.session_created", ws_id=ws_id, room_id=room_id, model=model
+                )
             except Exception:
                 log.exception("matrix.session_create_failed", room_id=room_id)
                 return
@@ -380,6 +421,30 @@ class TurnstoneMatrixBot:
             log.info("matrix.message_dispatched", ws_id=ws_id, room_id=room_id)
         except Exception:
             log.exception("matrix.message_dispatch_failed", room_id=room_id)
+
+    def _resolve_pending_cycle_id(self, ws_id: str, prefix: str) -> str | None:
+        """Find the full cycle_id for this ws_id whose prefix the user typed."""
+        for (wid, cid) in self._pending_approval:
+            if wid == ws_id and cid.lower().startswith(prefix):
+                return cid
+        return None
+
+    def _persona_for_room(self, room: Any) -> str:
+        """Look up the model alias for a new workstream from the room name.
+
+        config.room_personas maps a Matrix room display name (as set by
+        whoever created the room) to a model alias, e.g. {"Council":
+        "council"}. Unmatched rooms fall back to "" (server default),
+        the prior behavior for every room.
+        """
+        personas = getattr(self.config, "room_personas", None)
+        if not personas:
+            return ""
+        name = (getattr(room, "display_name", "") or "").strip().lower()
+        for room_name, model in personas.items():
+            if room_name.strip().lower() == name:
+                return model
+        return ""
 
     async def _get_room_ws(self, room_id: str) -> str | None:
         """Look up the workstream ID for a Matrix room."""
