@@ -50,6 +50,10 @@ import re
 from pathlib import Path
 from typing import Any
 
+from turnstone.core.effectiveness_check import (
+    check_launchd_daemon_alive,
+    extract_launchd_targets,
+)
 from turnstone.core.log import get_logger
 
 log = get_logger(__name__)
@@ -167,6 +171,26 @@ def _extract_tool_calls_from_jsonl(path: Path) -> list[tuple[str, bool]]:
     tolerance as ``parse_full_output_records``.
     """
     out: list[tuple[str, bool]] = []
+    for name, _command, denied in _extract_bash_aware_tool_calls_from_jsonl(path):
+        out.append((name, denied))
+    return out
+
+
+def _extract_bash_aware_tool_calls_from_jsonl(
+    path: Path,
+) -> list[tuple[str, str | None, bool]]:
+    """Return ``(tool_name, bash_command_or_None, denied)`` triples.
+
+    Extends the plain name-only extraction with the raw ``command`` input
+    for ``Bash``/``bash`` calls specifically — needed by the effectiveness
+    check below to recognize a launchd-fix attempt (e.g.
+    ``launchctl kickstart -k gui/501/com.example.foo``). This does NOT
+    widen what gets *persisted*: only the resolved PASS/FAIL evidence tag
+    from the effectiveness check is written to ``evidence``, never the raw
+    command text — the "names only" boundary from the MCP-visibility task
+    still holds for the tool-name list itself.
+    """
+    out: list[tuple[str, str | None, bool]] = []
     try:
         text = path.read_text(errors="replace")
     except OSError:
@@ -190,7 +214,14 @@ def _extract_tool_calls_from_jsonl(path: Path) -> list[tuple[str, bool]]:
             if not isinstance(name, str) or not name:
                 continue
             denied = bool(rec.get("permission_denial") or block.get("permission_denial"))
-            out.append((name, denied))
+            command = None
+            if name.lower() == "bash":
+                block_input = block.get("input")
+                if isinstance(block_input, dict):
+                    cmd = block_input.get("command")
+                    if isinstance(cmd, str):
+                        command = cmd
+            out.append((name, command, denied))
     return out
 
 
@@ -220,6 +251,42 @@ def collect_session_tool_names(session_id: str) -> tuple[list[tuple[str, bool]],
     for sub_path in _find_subagent_transcripts(session_id):
         calls.extend(_extract_tool_calls_from_jsonl(sub_path))
     return calls, "ok"
+
+
+def collect_session_launchd_targets(session_id: str) -> list[str]:
+    """Scan a session's transcript(s) (top-level + subagents) for bash calls
+    that attempted a launchd start/kickstart/load, and return the distinct
+    labels targeted.
+
+    Mirrors ``collect_session_tool_names``'s glob strategy (never a fixed
+    project directory — see that function's docstring) but reads the
+    bash-aware extraction so it can inspect ``command`` text. An empty
+    ``session_id`` or an unresolvable transcript both yield ``[]`` — this is
+    an additive, best-effort signal, not a hard requirement of every proxy
+    verdict.
+    """
+    if not session_id:
+        return []
+    matches = _find_session_transcripts(session_id)
+    if not matches:
+        return []
+    chosen = max(matches, key=lambda p: p.stat().st_mtime) if len(matches) > 1 else matches[0]
+    paths = [chosen, *_find_subagent_transcripts(session_id)]
+
+    targets: list[str] = []
+    for path in paths:
+        for name, command, _denied in _extract_bash_aware_tool_calls_from_jsonl(path):
+            if command is None:
+                continue
+            targets.extend(extract_launchd_targets(command))
+    # Distinct, order-preserving.
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in targets:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 # Tracks the debug log's byte size as of the last `sync_proxy_trace_verdicts`
 # call, keyed by resolved path string. Lets that function tell "the log grew
@@ -335,6 +402,20 @@ def verdict_row_from_record(
                 for name in unexpected:
                     evidence.append(f"UNEXPECTED_TOOL:{name}")
                 if unexpected:
+                    risk_level, recommendation = "high", "review"
+
+        # "Executed" vs "effective" (independent second check, launchd task
+        # class only — see turnstone.core.effectiveness_check). This does
+        # NOT reuse launchctl or anything the session's own bash call used;
+        # it is a genuinely separate plist-read + ps-scan. A FAIL here means
+        # the session's self-reported fix disagrees with observed reality —
+        # that disagreement escalates the verdict, it is never silently
+        # cleared, mirroring the runbook skills' independent-check contract.
+        if session_id:
+            for label in collect_session_launchd_targets(session_id):
+                result = check_launchd_daemon_alive(label)
+                evidence.append(result.as_evidence_tag())
+                if not result.passed:
                     risk_level, recommendation = "high", "review"
 
     intent_summary = (

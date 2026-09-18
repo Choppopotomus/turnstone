@@ -92,3 +92,112 @@ byte-identical to pre-patch behavior via a direct request + debug-log check.
 originally found on `[models.poe]`) fixed same day — verified via a live
 chat completion through port 9997 returning 200 with real content. No known
 gaps remain.
+
+## Independent effectiveness check — "executed" vs "effective" (2026-09-18)
+
+**Problem:** the judge (heuristic + LLM) and `proxy_trace.py`'s per-tool-name
+visibility (see previous entry) both answer "did a tool call happen and did
+it look safe" — advisory, at-or-before-execution questions. Neither confirms
+the delegated work actually fixed the need it was requested for. A proxied
+session that runs `launchctl kickstart` and completes cleanly (few turns, no
+permission denials) reads as `low`/`approve` under the existing heuristic
+even when the fix silently failed — reproduced live during this task (see
+Verification below): a genuinely broken fix (plist pointing at a
+nonexistent binary) produced `num_turns=4, permission_denials=0`, which the
+pre-existing `_risk_and_recommendation` heuristic alone would have scored
+`low`/`approve`.
+
+**Fix:** ported the same "independently-implemented second check" discipline
+already proven in `~/.claude/skills/runbook-security-posture-check` /
+`runbook-service-health` / `runbook-launchd-fleet-audit` — a check that does
+NOT reuse the mechanism that performed the fix, with disagreement escalating
+rather than silently clearing. Scoped to one concrete, real task class:
+**launchd daemon restart/(re)start fixes** (a class of work these same
+runbook skills already handle, and the only class implemented so far — see
+`turnstone/core/effectiveness_check.py`'s module docstring for why other
+classes need their own separate check function, not a universal one).
+
+**Files changed:**
+
+- `turnstone/core/effectiveness_check.py` (new) — `extract_launchd_targets()`
+  parses a bash command for a launchd label the way real commands actually
+  write it (bare label, `gui/<uid>/<label>`, a `.plist` path, or a
+  `bootstrap <domain> <path>` pair — see the command-substitution note
+  below). `check_launchd_daemon_alive()` is the independent check: reads the
+  target's plist directly via `plistlib` (never `launchctl`) to recover its
+  expected `ProgramArguments`, then cross-references the real process table
+  via `ps -eo pid=,args=` (never `launchctl list`/`print`). Returns an
+  `EffectivenessResult` with a `PASS`/`FAIL` verdict and evidence string.
+- `turnstone/core/proxy_trace.py` — `_extract_bash_aware_tool_calls_from_jsonl()`
+  extends the existing name-only transcript extraction to also surface a
+  `Bash` call's raw `command` text (in-memory only; never persisted — the
+  "names only" boundary from the MCP-visibility task still holds for the
+  stored tool-name list itself, only the resolved PASS/FAIL tag is written).
+  `collect_session_launchd_targets()` mirrors `collect_session_tool_names()`'s
+  glob strategy to find every launchd label a session's bash calls (top-level
+  + subagent transcripts) attempted to bring up. `verdict_row_from_record()`
+  runs `check_launchd_daemon_alive()` for each target and appends
+  `EFFECTIVENESS_CHECK:launchd:<label>:PASS|FAIL:<detail>` to `evidence`,
+  escalating `risk_level`/`recommendation` to `high`/`review` on FAIL —
+  same escalation shape already used for `UNEXPECTED_TOOL`. Computed at
+  first-INSERT time only, same `ON CONFLICT`-drops-`evidence` constraint as
+  the tool-name work above.
+
+**Real bug found and fixed during live testing:** the first version of
+`extract_launchd_targets()` tokenized on whitespace, which broke on the
+real idiom `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/X.plist`
+— the internal space inside `$(id -u)` split it into two tokens, capturing
+`gui/$(id` as the "label". Fixed by collapsing whitespace inside any
+`$(...)` substitution before tokenizing, plus an independent second pass
+that scans for any `.plist` path anywhere in the command (needed for
+`bootstrap`, where the verb-adjacent argument is a bare domain, not a
+label — the label only appears in the plist path argument).
+
+**Verified live, 2026-09-18, not just unit-tested against synthetic
+fixtures** (`tests/test_effectiveness_check.py`, 11/11; `tests/test_proxy_trace.py`
+new wiring tests, 32/32 combined; full existing suite unaffected):
+
+1. Stood up a disposable KeepAlive launchd job (`com.turnstone.effectiveness-demo`,
+   `/bin/sleep`) — the disposable-test-task pattern, not production
+   infrastructure.
+2. Stopped it for real (`launchctl bootout`), then ran a genuine live
+   `claude -p --allowedTools Bash` subprocess (the same mechanism
+   `claude_proxy.py` wraps) asking it to check and restart the job. It ran
+   real bash calls (`launchctl kickstart -k gui/$(id -u)/...`), the daemon
+   came back up for real (new PID confirmed via `pgrep`), and it self-reported
+   success. Ran the real session transcript through `verdict_row_from_record()`:
+   evidence correctly recorded `EFFECTIVENESS_CHECK:launchd:com.turnstone.effectiveness-demo:PASS:pid=<real pid> args matched via ps process-table scan`, risk stayed governed by other signals (not falsely escalated by this check).
+3. **Disagreement case — the one that matters.** Replaced the plist with one
+   pointing at a nonexistent binary, stopped the job, and ran the same real
+   `claude -p` flow again. The agent behaved honestly (correctly diagnosed
+   `EX_CONFIG`/exec failure and said outright it could not fix it) — but the
+   *session-level* signal an unaugmented Turnstone would see
+   (`num_turns=4, permission_denials=0`) reads as `low`/`approve` under the
+   pre-existing heuristic alone. Running the real transcript through the
+   patched `verdict_row_from_record()` correctly produced
+   `EFFECTIVENESS_CHECK:launchd:com.turnstone.effectiveness-demo:FAIL:no live process found matching program='does-not-exist-binary' extra='100000'`
+   and escalated the verdict to `high`/`review` — confirmed via a real,
+   independent `ps` scan against the real (non-)running process, with zero
+   `launchctl` calls anywhere in the check path.
+4. Cleaned up: bootout the disposable job. `~/Library/LaunchAgents/com.turnstone.effectiveness-demo.plist`
+   and the two ad hoc session JSONL transcripts under
+   `~/.claude/projects/-Users-c-Claude/` were left in place for Chopp to
+   remove (per the deletions-route-to-Chopp rule), not self-deleted.
+
+**Known limitation, stated not hidden:** only the `launchd` task class has
+an independent check. The wiring point (`verdict_row_from_record`) is
+per-record and evidence-append, so a second task class (e.g. a
+file-permission fix) would need its own `check_*` function in
+`effectiveness_check.py` and its own bash-command pattern recognized in
+`collect_session_launchd_targets`'s sibling extractor — not a drop-in
+generalization, by design (see that module's docstring on why one universal
+check is the wrong shape). This closes register task `7dd8ecc2` to the
+extent scoped ("at least one real task class... demonstrated on a real
+delegated run") — it does NOT close `78677f36` ("live-test narrow
+silent-tier slice end-to-end, no Chopp involvement"), which remains blocked
+on `1f1bf7bc` (the silent-tier scope decision, Chopp-owned,
+`smart_approvals=false` still deliberately set) and is a separate,
+later-phase milestone.
+
+**Status:** DEPLOYED (fork-local, not upstream) and live-verified,
+2026-09-18. Register task `7dd8ecc2`.

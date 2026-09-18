@@ -284,6 +284,79 @@ def test_verdict_row_flags_unexpected_tool_and_escalates_risk(monkeypatch) -> No
     assert row["recommendation"] == "review"
 
 
+def test_verdict_row_effectiveness_check_pass_stays_low_risk(monkeypatch) -> None:
+    """Wiring test: a launchd fix attempt whose independent check PASSes
+    must not, by itself, escalate risk — mirrors the runbook pattern's
+    "agreement clears silently" half of the contract.
+    """
+    monkeypatch.setattr(proxy_trace, "collect_session_tool_names", lambda sid: ([("Bash", False)], "ok"))
+    monkeypatch.setattr(
+        proxy_trace, "collect_session_launchd_targets", lambda sid: ["com.example.demo"]
+    )
+    from turnstone.core.effectiveness_check import EffectivenessResult
+
+    monkeypatch.setattr(
+        proxy_trace,
+        "check_launchd_daemon_alive",
+        lambda label: EffectivenessResult(
+            task_class="launchd", target=label, passed=True,
+            method="ps_process_table", detail="pid=123 matched",
+        ),
+    )
+    record = json.loads(
+        _full_output_line(session_id="sess-eff-pass", uuid="uuid-eff-pass", num_turns=1).split(": ", 1)[1]
+    )
+    row = proxy_trace.verdict_row_from_record(record, alias="claude-subscription", port=9999)
+    evidence = json.loads(row["evidence"])
+    assert "EFFECTIVENESS_CHECK:launchd:com.example.demo:PASS:pid=123 matched" in evidence
+    assert row["risk_level"] == "low"
+    assert row["recommendation"] == "approve"
+
+
+def test_verdict_row_effectiveness_check_fail_escalates_risk(monkeypatch) -> None:
+    """The disagreement case: the delegated session's own tool-use signals
+    look clean (no permission denials, few turns), but the independent
+    check disagrees with the implied "it's fixed" outcome — this must
+    escalate, never silently clear, matching the runbook contract's
+    'disagreement escalates' rule.
+    """
+    monkeypatch.setattr(proxy_trace, "collect_session_tool_names", lambda sid: ([("Bash", False)], "ok"))
+    monkeypatch.setattr(
+        proxy_trace, "collect_session_launchd_targets", lambda sid: ["com.example.demo"]
+    )
+    from turnstone.core.effectiveness_check import EffectivenessResult
+
+    monkeypatch.setattr(
+        proxy_trace,
+        "check_launchd_daemon_alive",
+        lambda label: EffectivenessResult(
+            task_class="launchd", target=label, passed=False,
+            method="ps_process_table", detail="no live process found",
+        ),
+    )
+    record = json.loads(
+        _full_output_line(session_id="sess-eff-fail", uuid="uuid-eff-fail", num_turns=1).split(": ", 1)[1]
+    )
+    row = proxy_trace.verdict_row_from_record(record, alias="claude-subscription", port=9999)
+    evidence = json.loads(row["evidence"])
+    assert "EFFECTIVENESS_CHECK:launchd:com.example.demo:FAIL:no live process found" in evidence
+    assert row["risk_level"] == "high"
+    assert row["recommendation"] == "review"
+
+
+def test_verdict_row_effectiveness_check_skipped_without_session_id(monkeypatch) -> None:
+    called = {"n": 0}
+
+    def _boom(sid: str) -> list[str]:
+        called["n"] += 1
+        return []
+
+    monkeypatch.setattr(proxy_trace, "collect_session_launchd_targets", _boom)
+    record = json.loads(_full_output_line(session_id="", uuid="").split(": ", 1)[1])
+    proxy_trace.verdict_row_from_record(record, alias="claude-subscription", port=9998)
+    assert called["n"] == 0
+
+
 def test_malformed_transcript_line_skipped(tmp_path: Path) -> None:
     path = tmp_path / "sess-z.jsonl"
     good = json.dumps({"message": {"content": [{"type": "tool_use", "name": "Bash"}]}})
