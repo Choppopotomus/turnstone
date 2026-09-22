@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 from typing import TYPE_CHECKING
 
 import httpx
@@ -159,5 +160,7 @@ async def run_sse_stream(
         except Exception:
             log.warning(f"{log_prefix}.sse_error", ws_id=ws_id, exc_info=True)
 
-        await asyncio.sleep(delay)
+        # Full jitter (0..delay) so a server restart doesn't cause every
+        # workstream's SSE loop to reconnect on the same synchronized cadence.
+        await asyncio.sleep(random.uniform(0, delay))
         delay = min(delay * 2, SSE_MAX_RECONNECT_DELAY)
