@@ -22,11 +22,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import re
 import signal
 import ssl
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import httpx
@@ -72,6 +74,15 @@ _APPROVAL_REPLY_RE = re.compile(r"^(approve|deny)\s+([0-9a-f-]{4,})\s*$", re.IGN
 
 # Matrix has generous message limits but we cap for readability.
 _MAX_INBOUND_MESSAGE_LEN: int = 16384
+
+# Same mem0-capture.ts contract the CLI Stop hook uses
+# (~/.claude/hooks/mem0-capture-hook.py): stdin JSON {sessionId, cwd,
+# messages}, classifies open-vs-restricted, writes to the matching mem0
+# collection. Reused rather than reimplemented -- this is the only place
+# that turns a raw {role, content} span into a mem0 write, CLI or Matrix.
+_MEM0_CAPTURE_SCRIPT = Path(
+    "/Users/c/Claude/Projects/PKI/Mycroft/v2-implementation/agents/mem0-capture.ts"
+)
 
 
 @dataclass
@@ -192,6 +203,10 @@ class TurnstoneMatrixBot:
         self._pending_approval: dict[tuple[str, str], dict[str, Any]] = {}
         self._notify_ws_map: dict[str, tuple[str, str]] = {}
         self._notify_reply_rooms: dict[str, str] = {}
+        # Last inbound chat text per ws_id, consumed by _capture_mem0() once
+        # the matching assistant reply finalizes. Not a history buffer --
+        # one turn's worth, overwritten on the next message.
+        self._last_user_text: dict[str, str] = {}
 
         # -- missed-turn recovery (turn-completes-entirely-during-disconnect) --
         # ``connected``/``status`` replay on every fresh/truncated SSE
@@ -417,6 +432,7 @@ class TurnstoneMatrixBot:
 
         # Route message to workstream
         try:
+            self._last_user_text[ws_id] = text
             await self.router.send_message(ws_id, text)
             log.info("matrix.message_dispatched", ws_id=ws_id, room_id=room_id)
         except Exception:
@@ -678,6 +694,52 @@ class TurnstoneMatrixBot:
         sm = self._streaming.pop(ws_id, None)
         if sm is not None:
             await sm.finalize()
+            user_text = self._last_user_text.pop(ws_id, "")
+            if user_text and sm.accumulated_text:
+                asyncio.create_task(
+                    self._capture_mem0(ws_id, room_id, user_text, sm.accumulated_text)
+                )
+
+    async def _capture_mem0(
+        self, ws_id: str, room_id: str, user_text: str, assistant_text: str
+    ) -> None:
+        """Send one finished turn to mem0, mirroring the CLI Stop hook's
+        contract (mem0-capture.ts classifies open-vs-restricted and writes
+        to the matching collection). Fire-and-forget: a capture failure
+        must never disrupt or delay the chat itself.
+        """
+        payload = json.dumps(
+            {
+                "sessionId": ws_id,
+                "cwd": f"matrix:{room_id}",
+                "messages": [
+                    {"role": "user", "content": user_text[:1000]},
+                    {"role": "assistant", "content": assistant_text[:1000]},
+                ],
+            }
+        )
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "npx",
+                "tsx",
+                str(_MEM0_CAPTURE_SCRIPT),
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(_MEM0_CAPTURE_SCRIPT.parent.parent),
+            )
+            _, stderr = await asyncio.wait_for(
+                proc.communicate(payload.encode()), timeout=200
+            )
+            if proc.returncode != 0:
+                log.warning(
+                    "matrix.mem0_capture_failed",
+                    ws_id=ws_id,
+                    room_id=room_id,
+                    stderr=stderr.decode(errors="replace")[:500],
+                )
+        except Exception:
+            log.warning("matrix.mem0_capture_failed", ws_id=ws_id, room_id=room_id, exc_info=True)
             if sm.accumulated_text:
                 # So a later missed-turn recovery check (see
                 # _recover_missed_turn) can tell "already sent" apart
