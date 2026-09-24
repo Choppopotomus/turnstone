@@ -72,6 +72,13 @@ log = get_logger(__name__)
 # phone keyboards auto-capitalize.
 _APPROVAL_REPLY_RE = re.compile(r"^(approve|deny)\s+([0-9a-f-]{4,})\s*$", re.IGNORECASE)
 
+# "/model <alias>" in-chat command. Aliases must match a real config.toml
+# [models.*] section (see ~/.config/turnstone/config.toml) -- kept as an
+# explicit allowlist rather than reading the live registry so an unrecognized
+# room command fails with a clear message instead of a 400 from the server.
+_MODEL_SWITCH_RE = re.compile(r"^/model\s+(\w+)\s*$", re.IGNORECASE)
+_AVAILABLE_MODELS = ("poe", "local")
+
 # Matrix has generous message limits but we cap for readability.
 _MAX_INBOUND_MESSAGE_LEN: int = 16384
 
@@ -379,6 +386,46 @@ class TurnstoneMatrixBot:
 
         # Check if this room has an active session
         ws_id = await self._get_room_ws(room_id)
+
+        # "/model <alias>" switches which backend answers in this room.
+        # Turnstone has no in-place "change this workstream's model" op, so
+        # this deletes the room's route and starts a fresh workstream bound
+        # to the requested alias -- the old one keeps existing (still
+        # reachable via --resume) but this room no longer talks to it.
+        model_match = _MODEL_SWITCH_RE.match(text)
+        if model_match:
+            requested = model_match.group(1).lower()
+            if requested not in _AVAILABLE_MODELS:
+                await self._send_text(
+                    room_id,
+                    f"Unknown model `{requested}`. Available: "
+                    f"{', '.join(_AVAILABLE_MODELS)}.",
+                )
+                return
+            if ws_id is not None:
+                await self.unsubscribe_ws(ws_id)
+                await self.router.delete_route("matrix", room_id)
+            try:
+                ws_id, _ = await self.router.get_or_create_workstream(
+                    channel_type="matrix",
+                    channel_id=room_id,
+                    name=f"matrix-{room_id[:16]}",
+                    model=requested,
+                    client_type="chat",
+                )
+                await self.subscribe_ws(ws_id, room_id)
+                log.info(
+                    "matrix.model_switched", ws_id=ws_id, room_id=room_id, model=requested
+                )
+                await self._send_text(
+                    room_id,
+                    f"Switched to `{requested}`. This is a fresh workstream -- "
+                    "prior conversation context isn't carried over.",
+                )
+            except Exception:
+                log.exception("matrix.model_switch_failed", room_id=room_id)
+                await self._send_text(room_id, "Failed to switch models -- check the logs.")
+            return
 
         # An "approve <id>"/"deny <id>" reply to a pending Tool Approval
         # Required prompt was previously forwarded to the model as a plain
