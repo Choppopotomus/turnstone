@@ -387,6 +387,32 @@ class TurnstoneMatrixBot:
         # Check if this room has an active session
         ws_id = await self._get_room_ws(room_id)
 
+        # Sender-pinned personas (config.user_personas, e.g. Sana -> "sana").
+        # Fails closed: a pinned sender's message is only dispatched to a
+        # workstream this bot created for her with her alias, recorded by
+        # ws_id in pinned_rooms.json. Room names and /model can't move her
+        # onto another model. The workstreams table has no model column, so
+        # the pin file is the only record of which model a room's ws uses.
+        pinned_alias = (self.config.user_personas or {}).get(sender)
+        pins = self._load_pins()
+        room_pin = pins.get(room_id)
+        if (pinned_alias or room_pin) and _MODEL_SWITCH_RE.match(text):
+            await self._send_text(room_id, "Model switching is disabled in this room.")
+            return
+        if pinned_alias:
+            wrong_alias = room_pin is not None and room_pin.get("alias") != pinned_alias
+            foreign_ws = ws_id is not None and (
+                room_pin is None or room_pin.get("ws_id") != ws_id
+            )
+            if wrong_alias or foreign_ws:
+                log.warning(
+                    "matrix.pinned_sender_refused", sender=sender, room_id=room_id, ws_id=ws_id
+                )
+                await self._send_text(
+                    room_id, "This room isn't set up for you. Please use your own room."
+                )
+                return
+
         # "/model <alias>" switches which backend answers in this room.
         # Turnstone has no in-place "change this workstream's model" op, so
         # this deletes the room's route and starts a fresh workstream bound
@@ -460,7 +486,14 @@ class TurnstoneMatrixBot:
             # specific model when the room's display name matches
             # config.room_personas (case-insensitive) -- e.g. a room named
             # "Council" gets model="council" instead of the server default.
-            model = self._persona_for_room(room)
+            # A pinned room keeps its alias whoever posts first after a
+            # route reset; a pinned sender always gets her own alias.
+            if room_pin:
+                model = room_pin["alias"]
+            elif pinned_alias:
+                model = pinned_alias
+            else:
+                model = self._persona_for_room(room)
             try:
                 ws_id, _ = await self.router.get_or_create_workstream(
                     channel_type="matrix",
@@ -469,6 +502,9 @@ class TurnstoneMatrixBot:
                     model=model,
                     client_type="chat",
                 )
+                if room_pin or pinned_alias:
+                    pins[room_id] = {"alias": model, "ws_id": ws_id}
+                    self._save_pins(pins)
                 await self.subscribe_ws(ws_id, room_id)
                 log.info(
                     "matrix.session_created", ws_id=ws_id, room_id=room_id, model=model
@@ -484,6 +520,26 @@ class TurnstoneMatrixBot:
             log.info("matrix.message_dispatched", ws_id=ws_id, room_id=room_id)
         except Exception:
             log.exception("matrix.message_dispatch_failed", room_id=room_id)
+
+    def _pins_path(self) -> Path:
+        return Path(self.config.store_path) / "pinned_rooms.json"
+
+    def _load_pins(self) -> dict[str, dict[str, str]]:
+        """room_id -> {"alias", "ws_id"} for rooms created for a pinned sender.
+
+        A missing file is empty; an unreadable one raises rather than
+        silently unpinning every room (which would fail open).
+        """
+        try:
+            return json.loads(self._pins_path().read_text())
+        except FileNotFoundError:
+            return {}
+
+    def _save_pins(self, pins: dict[str, dict[str, str]]) -> None:
+        path = self._pins_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(pins, indent=2))
+        os.replace(tmp, path)
 
     def _resolve_pending_cycle_id(self, ws_id: str, prefix: str) -> str | None:
         """Find the full cycle_id for this ws_id whose prefix the user typed."""

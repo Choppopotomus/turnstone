@@ -28,3 +28,7 @@ class MatrixConfig(ChannelConfig):
     # uses that model instead of the server default. Unmatched/empty = prior
     # behavior (server default for every room).
     room_personas: dict[str, str] | None = None
+    # Matrix user ID -> model alias, e.g. {"@sana:matrix.local": "sana"}.
+    # Pins that sender to that alias regardless of room name; see
+    # bot.py's pinned-sender guard (fails closed).
+    user_personas: dict[str, str] | None = None

@@ -131,6 +131,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "(default: $TURNSTONE_MATRIX_CA_CERT)",
     )
     parser.add_argument(
+        "--matrix-user-personas",
+        default=os.environ.get("TURNSTONE_MATRIX_USER_PERSONAS", ""),
+        help="JSON object mapping a Matrix user ID to a model alias, e.g. "
+        "'{\"@sana:matrix.local\": \"sana\"}' -- that sender only ever "
+        "reaches that model. Invalid JSON refuses to start. "
+        "(default: $TURNSTONE_MATRIX_USER_PERSONAS)",
+    )
+    parser.add_argument(
         "--matrix-room-personas",
         default=os.environ.get("TURNSTONE_MATRIX_ROOM_PERSONAS", ""),
         help="JSON object mapping a Matrix room display name to a model "
@@ -337,6 +345,15 @@ def _build_adapters(
                     raw=args.matrix_room_personas,
                 )
 
+        # Unlike room_personas, a bad value here must not degrade to "no
+        # pins" -- that would route a pinned sender to the server default.
+        user_personas: dict[str, str] = {}
+        if args.matrix_user_personas:
+            try:
+                user_personas = json.loads(args.matrix_user_personas)
+            except (json.JSONDecodeError, TypeError):
+                sys.exit("--matrix-user-personas is not valid JSON; refusing to start")
+
         matrix_config = MatrixConfig(
             server_url=server_url,
             model=args.model,
@@ -350,6 +367,7 @@ def _build_adapters(
             ),
             ca_cert_path=args.matrix_ca_cert,
             room_personas=room_personas,
+            user_personas=user_personas,
         )
         matrix_bot = TurnstoneMatrixBot(
             matrix_config,
