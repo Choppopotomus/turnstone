@@ -385,6 +385,58 @@ class ChannelRouter:
 
             return ws_id, True
 
+    async def create_forked_workstream(
+        self,
+        *,
+        name: str,
+        model: str,
+        resume_ws: str,
+        client_type: str = "",
+    ) -> tuple[str, bool, int]:
+        """Create a workstream that fork-resumes *resume_ws*'s history.
+
+        Unlike :meth:`get_or_create_workstream` this does NOT touch the
+        channel route -- the caller swaps routes only after confirming the
+        fork actually carried history (``resumed``).  Returns
+        ``(ws_id, resumed, message_count)``.
+        """
+        _tools_csv = ",".join(self._auto_approve_tools) if self._auto_approve_tools else ""
+        if self._console:
+            data = await self._console.route_create_workstream(
+                name=name,
+                model=model,
+                resume_ws=resume_ws,
+                skill=self._skill,
+                auto_approve=self._auto_approve,
+                auto_approve_tools=_tools_csv,
+                client_type=client_type,
+            )
+            ws_id = data.get("ws_id", "")
+            resumed = bool(data.get("resumed", False))
+            count = int(data.get("message_count", 0) or 0)
+            node_url = data.get("node_url", "")
+            if ws_id and node_url:
+                self._node_urls[ws_id] = node_url.rstrip("/")
+        else:
+            assert self._server is not None
+            resp = await self._server.create_workstream(
+                name=name,
+                model=model,
+                resume_ws=resume_ws,
+                skill=self._skill,
+                auto_approve=self._auto_approve,
+                auto_approve_tools=_tools_csv,
+                client_type=client_type,
+            )
+            ws_id, resumed, count = resp.ws_id, resp.resumed, resp.message_count
+        if not ws_id:
+            raise RuntimeError("workstream creation returned empty ws_id")
+        return ws_id, resumed, count
+
+    async def create_route(self, channel_type: str, channel_id: str, ws_id: str) -> None:
+        """Persist a channel -> workstream route."""
+        await asyncio.to_thread(self._storage.create_channel_route, channel_type, channel_id, ws_id)
+
     async def get_node_url(self, ws_id: str) -> str:
         """Return the direct server URL for SSE connections to *ws_id*.
 

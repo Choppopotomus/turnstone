@@ -41,6 +41,7 @@ from turnstone.channels._routing import (
     pop_ws_entries,
 )
 from turnstone.channels._sse import run_sse_stream
+from turnstone.channels.matrix.seed import build_seed_workstream
 from turnstone.core.log import get_logger
 from turnstone.sdk.events import (
     ApprovalResolvedEvent,
@@ -415,9 +416,10 @@ class TurnstoneMatrixBot:
 
         # "/model <alias>" switches which backend answers in this room.
         # Turnstone has no in-place "change this workstream's model" op, so
-        # this deletes the room's route and starts a fresh workstream bound
-        # to the requested alias -- the old one keeps existing (still
-        # reachable via --resume) but this room no longer talks to it.
+        # this starts a new workstream bound to the requested alias, seeded
+        # with the old one's transcript (see matrix/seed.py) so context
+        # carries over. The route is only swapped after the seeded create
+        # succeeds -- on any failure the room stays on its old workstream.
         model_match = _MODEL_SWITCH_RE.match(text)
         if model_match:
             requested = model_match.group(1).lower()
@@ -428,29 +430,25 @@ class TurnstoneMatrixBot:
                     f"{', '.join(_AVAILABLE_MODELS)}.",
                 )
                 return
-            if ws_id is not None:
-                await self.unsubscribe_ws(ws_id)
-                await self.router.delete_route("matrix", room_id)
-            try:
-                ws_id, _ = await self.router.get_or_create_workstream(
-                    channel_type="matrix",
-                    channel_id=room_id,
-                    name=f"matrix-{room_id[:16]}",
-                    model=requested,
-                    client_type="chat",
-                )
-                await self.subscribe_ws(ws_id, room_id)
-                log.info(
-                    "matrix.model_switched", ws_id=ws_id, room_id=room_id, model=requested
-                )
-                await self._send_text(
-                    room_id,
-                    f"Switched to `{requested}`. This is a fresh workstream -- "
-                    "prior conversation context isn't carried over.",
-                )
-            except Exception:
-                log.exception("matrix.model_switch_failed", room_id=room_id)
-                await self._send_text(room_id, "Failed to switch models -- check the logs.")
+            if ws_id is None:
+                try:
+                    ws_id, _ = await self.router.get_or_create_workstream(
+                        channel_type="matrix",
+                        channel_id=room_id,
+                        name=f"matrix-{room_id[:16]}",
+                        model=requested,
+                        client_type="chat",
+                    )
+                    await self.subscribe_ws(ws_id, room_id)
+                    log.info(
+                        "matrix.model_switched", ws_id=ws_id, room_id=room_id, model=requested
+                    )
+                    await self._send_text(room_id, f"Switched to `{requested}`.")
+                except Exception:
+                    log.exception("matrix.model_switch_failed", room_id=room_id)
+                    await self._send_text(room_id, "Failed to switch models -- check the logs.")
+                return
+            await self._switch_model_seeded(room_id, ws_id, requested)
             return
 
         # An "approve <id>"/"deny <id>" reply to a pending Tool Approval
@@ -526,6 +524,75 @@ class TurnstoneMatrixBot:
             log.info("matrix.message_dispatched", ws_id=ws_id, room_id=room_id)
         except Exception:
             log.exception("matrix.message_dispatch_failed", room_id=room_id)
+
+    async def _switch_model_seeded(self, room_id: str, old_ws_id: str, alias: str) -> None:
+        """Move *room_id* to a new *alias* workstream carrying old context.
+
+        Order: build scratch seed -> fork-create new ws -> verify it
+        resumed -> swap route + subscription. Any failure before the swap
+        leaves the old route/subscription untouched and replies an error.
+        """
+        scratch: str | None = None
+        new_ws_id: str | None = None
+        route_swapped = False
+        try:
+            scratch, seeded = await asyncio.to_thread(
+                build_seed_workstream, self.storage, old_ws_id, alias
+            )
+            if scratch is None:
+                new_ws_id, _, _ = await self.router.create_forked_workstream(
+                    name=f"matrix-{room_id[:16]}", model=alias, resume_ws="",
+                    client_type="chat",
+                )
+            else:
+                new_ws_id, resumed, count = await self.router.create_forked_workstream(
+                    name=f"matrix-{room_id[:16]}", model=alias, resume_ws=scratch,
+                    client_type="chat",
+                )
+                if not resumed or count == 0:
+                    raise RuntimeError(f"seed not applied (resumed={resumed}, count={count})")
+            # Swap: old route out, new route in, then move the subscription.
+            route_swapped = True
+            await self.router.delete_route("matrix", room_id)
+            await self.router.create_route("matrix", room_id, new_ws_id)
+            await self.unsubscribe_ws(old_ws_id)
+            await self.subscribe_ws(new_ws_id, room_id)
+        except Exception:
+            log.exception(
+                "matrix.model_switch_failed", room_id=room_id, old_ws_id=old_ws_id, model=alias
+            )
+            if route_swapped:
+                # Put the room back on its old workstream.
+                with contextlib.suppress(Exception):
+                    await self.router.delete_route("matrix", room_id)
+                with contextlib.suppress(Exception):
+                    await self.router.create_route("matrix", room_id, old_ws_id)
+                with contextlib.suppress(Exception):
+                    await self.unsubscribe_ws(new_ws_id)  # type: ignore[arg-type]
+                with contextlib.suppress(Exception):
+                    await self.subscribe_ws(old_ws_id, room_id)
+            if new_ws_id is not None:
+                with contextlib.suppress(Exception):
+                    await self.router.close_workstream(new_ws_id)
+            await self._send_text(
+                room_id,
+                "Failed to switch models -- still on the previous model; check the logs.",
+            )
+            return
+        finally:
+            if scratch is not None:
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(self.storage.delete_workstream, scratch)
+        log.info(
+            "matrix.model_switched",
+            ws_id=new_ws_id,
+            old_ws_id=old_ws_id,
+            room_id=room_id,
+            model=alias,
+            seeded=seeded,
+        )
+        carried = f" Carried over {seeded} prior messages." if seeded else ""
+        await self._send_text(room_id, f"Switched to `{alias}`.{carried}")
 
     def _pins_path(self) -> Path:
         return Path(self.config.store_path) / "pinned_rooms.json"
