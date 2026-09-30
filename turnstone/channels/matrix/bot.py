@@ -515,7 +515,13 @@ class TurnstoneMatrixBot:
 
         # Route message to workstream
         try:
-            self._last_user_text[ws_id] = text
+            # Pinned personas (sender pinned, or room pinned for anyone who
+            # posts in it) are never captured into Chopp's mem0 -- record no
+            # user text, so _handle_stream_end has nothing to send.
+            if pinned_alias or room_pin or pins.get(room_id):
+                self._last_user_text.pop(ws_id, None)
+            else:
+                self._last_user_text[ws_id] = text
             await self.router.send_message(ws_id, text)
             log.info("matrix.message_dispatched", ws_id=ws_id, room_id=room_id)
         except Exception:
@@ -534,6 +540,19 @@ class TurnstoneMatrixBot:
             return json.loads(self._pins_path().read_text())
         except FileNotFoundError:
             return {}
+
+    def _is_pinned_turn(self, ws_id: str, room_id: str) -> bool:
+        """True if this room/ws belongs to a pinned persona -- or if that
+        can't be determined (unreadable pin file), so mem0 capture fails
+        closed rather than leaking a pinned persona's turn."""
+        try:
+            pins = self._load_pins()
+        except Exception:
+            log.warning("matrix.pins_unreadable_skip_capture", ws_id=ws_id, room_id=room_id)
+            return True
+        if room_id in pins:
+            return True
+        return any(isinstance(p, dict) and p.get("ws_id") == ws_id for p in pins.values())
 
     def _save_pins(self, pins: dict[str, dict[str, str]]) -> None:
         path = self._pins_path()
@@ -798,7 +817,7 @@ class TurnstoneMatrixBot:
         if sm is not None:
             await sm.finalize()
             user_text = self._last_user_text.pop(ws_id, "")
-            if user_text and sm.accumulated_text:
+            if user_text and sm.accumulated_text and not self._is_pinned_turn(ws_id, room_id):
                 asyncio.create_task(
                     self._capture_mem0(ws_id, room_id, user_text, sm.accumulated_text)
                 )

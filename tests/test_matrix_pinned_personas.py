@@ -84,3 +84,43 @@ def test_route_reset_keeps_pinned_alias_when_other_user_posts_first(tmp_path) ->
     bot._get_room_ws.return_value = "ws-2"
     _msg(bot, SANA, "again")
     bot.router.send_message.assert_any_await("ws-2", "again")
+
+
+def _stream_end(bot, ws_id):  # type: ignore[no-untyped-def]
+    sm = SimpleNamespace(finalize=AsyncMock(), accumulated_text="reply")
+    bot._streaming[ws_id] = sm
+    bot._capture_mem0 = AsyncMock()
+    bot._persist_recovery_state = AsyncMock()
+
+    async def run() -> None:
+        await bot._handle_stream_end(ws_id, ROOM)
+        await asyncio.sleep(0)
+
+    asyncio.run(run())
+    return bot._capture_mem0
+
+
+def test_pinned_sender_turn_not_captured_to_mem0(tmp_path) -> None:
+    bot = _bot(tmp_path)
+    _msg(bot, SANA, "hello")
+    _stream_end(bot, "ws-new").assert_not_called()
+
+
+def test_other_user_in_pinned_room_not_captured(tmp_path) -> None:
+    bot = _bot(tmp_path, route_ws="ws-new")
+    bot._save_pins({ROOM: {"alias": "sana", "ws_id": "ws-new"}})
+    _msg(bot, CHOPP, "hi")
+    _stream_end(bot, "ws-new").assert_not_called()
+
+
+def test_unpinned_turn_still_captured(tmp_path) -> None:
+    bot = _bot(tmp_path, route_ws="ws-chopp")
+    _msg(bot, CHOPP, "hi")
+    _stream_end(bot, "ws-chopp").assert_called_once_with("ws-chopp", ROOM, "hi", "reply")
+
+
+def test_unreadable_pin_file_skips_capture(tmp_path) -> None:
+    bot = _bot(tmp_path, route_ws="ws-chopp")
+    bot._last_user_text["ws-chopp"] = "hi"
+    (tmp_path / "pinned_rooms.json").write_text("{not json")
+    _stream_end(bot, "ws-chopp").assert_not_called()
