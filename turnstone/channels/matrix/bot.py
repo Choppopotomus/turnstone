@@ -888,6 +888,18 @@ class TurnstoneMatrixBot:
                 asyncio.create_task(
                     self._capture_mem0(ws_id, room_id, user_text, sm.accumulated_text)
                 )
+            if sm.accumulated_text:
+                # So a later missed-turn recovery check (see
+                # _recover_missed_turn) can tell "already sent" apart
+                # from "genuinely new" and never double-post.
+                self._last_seen_text[ws_id] = sm.accumulated_text
+                await self._persist_recovery_state(room_id, last_seen_text=sm.accumulated_text)
+
+        reply_room = self._notify_reply_rooms.pop(ws_id, None)
+        if reply_room is not None and sm is not None and sm.accumulated_text:
+            self._track_notification(ws_id, reply_room)
+
+        self._pop_ws_approvals(ws_id)
 
     async def _capture_mem0(
         self, ws_id: str, room_id: str, user_text: str, assistant_text: str
@@ -929,18 +941,6 @@ class TurnstoneMatrixBot:
                 )
         except Exception:
             log.warning("matrix.mem0_capture_failed", ws_id=ws_id, room_id=room_id, exc_info=True)
-            if sm.accumulated_text:
-                # So a later missed-turn recovery check (see
-                # _recover_missed_turn) can tell "already sent" apart
-                # from "genuinely new" and never double-post.
-                self._last_seen_text[ws_id] = sm.accumulated_text
-                await self._persist_recovery_state(room_id, last_seen_text=sm.accumulated_text)
-
-        reply_room = self._notify_reply_rooms.pop(ws_id, None)
-        if reply_room is not None and sm is not None and sm.accumulated_text:
-            self._track_notification(ws_id, reply_room)
-
-        self._pop_ws_approvals(ws_id)
 
     async def _handle_error(self, room_id: str, event: ErrorEvent) -> None:
         safe_msg = event.message[:500] if event.message else "An error occurred"
